@@ -126,6 +126,8 @@ the DNA chemical modifications:
           }
       ],
       "unpairedMsaPath": "/path/to/rna_msa.a3m",
+      "templatesPath": "/path/to/rna_templates.csv",
+      "templateQueryId": "rna_query_1",
       "count": 1
   }
 }
@@ -137,8 +139,12 @@ the DNA chemical modifications:
   * `modificationType`: A string containing CCD code of modification.
   * `basePosition`: The position of the modified nucleotide (integer).
 * `unpairedMsaPath`: The path to a precomputed RNA MSA file (typically `.a3m`). **Absolute paths are recommended.** For an example, see `examples/examples_with_rna_msa/example_9gmw_2.json`.
+* `templatesPath`: The path to a precomputed RNA template hit table. Supported formats include `.csv` and `.m8`. **Absolute paths are recommended.**
+* `templateQueryId`: Optional query identifier used to select one query from a multi-query RNA template table. If omitted, the table must contain exactly one query.
 
-> 💡 **Note**: `unpairedMsaPath` is **Optional**. If this field is not provided, the model will proceed with inference without using the RNA MSA feature, which may lead to a potential decrease in prediction accuracy.
+> 💡 **Note**: `unpairedMsaPath`, `templatesPath`, and `templateQueryId` are all **Optional**. If these fields are not provided, the model will proceed without the corresponding RNA MSA/template features.
+
+> ⚠️ **Note**: RNA template inputs are currently supported only through manual `templatesPath` files at inference time. The `protenix mt` and `protenix prep` commands do not yet generate RNA template tables automatically.
 
 #### Tools for Generating MSA and Template Information
 Protenix provides CLI tools to automate the searching of MSAs and templates, which will automatically update your input JSON file with the relevant paths:
@@ -250,8 +256,10 @@ Here is a revised user guide compatible with **Version 2** of the `constraint` f
 ---
 
 ### constraint
-The `constraint` section specifies additional structural information to enable inter-chain guidance for Protenix. Currently, Protenix support two kind of constraint: `contact` and `pocket` constraint. 
+The `constraint` section specifies additional structural information to guide Protenix. Currently, Protenix support two kind of constraint: `contact` and `pocket` constraint. 
 The `contact` constraint allows you to specify residue/atom-residue/atom level priors. The `pocket` constraint is used to guide the binding interface between a chain of interest (e.g. a ligand or an antibody) and specific residues in another chain (e.g. epitopes).
+
+> 💡 Same-chain `contact` constraints are supported for `rnaSequence`. This is useful for injecting predicted RNA secondary structure as intra-chain base-pair priors. For proteins and other molecule types, `contact` remains an inter-chain constraint.
 
 > 💡 *This is a **soft constraint**: the model is encouraged, but not strictly required, to satisfy it.*
 
@@ -328,6 +336,10 @@ Specific atom in the second residue.
   The **expected maximum distance** (in Ångströms) between the specified residues or atoms.
 * `min_distance` (float):
   The **expected minimum distance** (in Ångströms) between the specified residues or atoms. For token-contact, you do not need to specify this field. It is 0 by default.
+
+For same-chain RNA contact:
+* `entity1 == entity2` and `copy1 == copy2` are allowed.
+* If the RNA entity has multiple copies, you should specify both `copy1` and `copy2` explicitly.
 
 #### pocket constraint
 

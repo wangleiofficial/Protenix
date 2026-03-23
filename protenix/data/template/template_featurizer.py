@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import os
 import time
 from datetime import datetime, timedelta
 from os.path import exists as opexists, join as opjoin
@@ -29,7 +30,11 @@ from protenix.data.constants import (
     RNA_CHAIN,
 )
 from protenix.data.msa.msa_utils import map_to_standard
-from protenix.data.template.template_parser import HHRParser, HmmsearchA3MParser
+from protenix.data.template.template_parser import (
+    HHRParser,
+    HmmsearchA3MParser,
+    RNATemplateTableParser,
+)
 from protenix.data.template.template_utils import (
     DAYS_BEFORE_QUERY_DATE,
     DistogramFeaturesConfig,
@@ -70,8 +75,88 @@ class TemplateSourceManager:
         self.mappings = mappings
         self.enabled = enabled
 
+    @staticmethod
+    def _get_lookup_key(
+        method: str,
+        pdb_id: str,
+        query_sequence: str,
+        sequence_uid: str,
+    ) -> str:
+        """Maps a configured indexing method to the corresponding lookup key."""
+        if method == "sequence":
+            return query_sequence
+        if method in {"pdb_id", "filename"}:
+            return pdb_id
+        if method == "sequence_uid":
+            return sequence_uid
+        raise ValueError(f"Unsupported template indexing method: {method}")
+
+    @staticmethod
+    def _default_subpaths(chain_entity_type: str) -> Sequence[str]:
+        """Returns default template filenames for a chain type."""
+        if chain_entity_type == PROTEIN_CHAIN:
+            return ("hmmsearch.a3m", "concat.hhr")
+        if chain_entity_type in {RNA_CHAIN, DNA_CHAIN}:
+            return ("result.csv", "result.m8")
+        return ()
+
+    def _resolve_mapping_entry(
+        self,
+        base_path: str,
+        entry: Any,
+        chain_entity_type: str,
+    ) -> List[str]:
+        """Resolves a mapping entry into template file paths."""
+        candidates = entry if isinstance(entry, list) else [entry]
+        template_paths: List[str] = []
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+
+            rel_or_abs = str(candidate)
+            full_path = (
+                rel_or_abs
+                if os.path.isabs(rel_or_abs) or not base_path
+                else opjoin(base_path, rel_or_abs)
+            )
+
+            if os.path.isfile(full_path):
+                template_paths.append(full_path)
+                continue
+
+            if os.path.isdir(full_path):
+                for subpath in self._default_subpaths(chain_entity_type):
+                    candidate_path = opjoin(full_path, subpath)
+                    if os.path.isfile(candidate_path):
+                        template_paths.append(candidate_path)
+
+        # Preserve order while removing duplicates.
+        return list(dict.fromkeys(template_paths))
+
+    def get_cache_key(
+        self,
+        pdb_id: str,
+        query_sequence: str,
+        sequence_uid: str,
+    ) -> Tuple[Tuple[str, str], ...]:
+        """Builds a cache key that respects the configured indexing methods."""
+        if not self.enabled:
+            return tuple()
+        return tuple(
+            (
+                method,
+                self._get_lookup_key(method, pdb_id, query_sequence, sequence_uid),
+            )
+            for method in self.indexing_methods
+        )
+
     def fetch_template_paths(
-        self, pdb_id: str, query_sequence: str, chain_entity_type: str
+        self,
+        pdb_id: str,
+        query_sequence: str,
+        chain_entity_type: str,
+        sequence_uid: str,
     ) -> List[str]:
         """
         Fetches template file paths from the configured sources.
@@ -82,30 +167,23 @@ class TemplateSourceManager:
             chain_entity_type: Type of the chain (e.g., PROTEIN_CHAIN).
 
         Returns:
-            A list of paths to found template files (.a3m or .hhr).
+            A list of paths to found template files.
         """
-        if not self.enabled or chain_entity_type != PROTEIN_CHAIN:
+        if not self.enabled:
             return []
 
         template_paths = []
         for i, (path, method) in enumerate(zip(self.raw_paths, self.indexing_methods)):
             mapping = self.mappings.get(i, {})
-            key = pdb_id if method == "pdb_id" else query_sequence
+            key = self._get_lookup_key(method, pdb_id, query_sequence, sequence_uid)
 
             if key not in mapping:
                 continue
 
-            dir_path = opjoin(path, str(mapping[key]))
-            # Check for multiple possible template filenames
-            possible_subpaths = [
-                "hmmsearch.a3m",
-                "concat.hhr",
-            ]
-            for subpath in possible_subpaths:
-                full_path = opjoin(dir_path, subpath)
-                if opexists(full_path):
-                    template_paths.append(full_path)
-        return template_paths
+            template_paths.extend(
+                self._resolve_mapping_entry(path, mapping[key], chain_entity_type)
+            )
+        return list(dict.fromkeys(template_paths))
 
 
 class TemplateFeatureAssemblyLine:
@@ -145,8 +223,10 @@ class TemplateFeatureAssemblyLine:
             chain_type = info["chain_entity_type"]
             num_tokens = len(info["sequence"])
 
-            # Templates are currently only supported for protein chains with sufficient length
-            skip_chain = chain_type != PROTEIN_CHAIN or num_tokens <= 4
+            # Templates are currently only supported for polymer chains with sufficient length
+            skip_chain = chain_type not in {PROTEIN_CHAIN, RNA_CHAIN, DNA_CHAIN} or (
+                num_tokens <= 4
+            )
 
             if (entity_id not in polymer_entity_features[skip_chain]) or (
                 entity_id not in safe_entity_ids
@@ -242,6 +322,12 @@ class TemplateFeaturizer:
         prot_seq_or_filename_to_templatedir_jsons: Sequence[str] = [""],
         prot_indexing_methods: Sequence[str] = ["sequence"],
         enable_prot_template: bool = True,
+        rna_template_mmcif_dir: str = "",
+        rna_template_cache_dir: str = None,
+        rna_template_raw_paths: Sequence[str] = [""],
+        rna_seq_or_filename_to_templatedir_jsons: Sequence[str] = [""],
+        rna_indexing_methods: Sequence[str] = ["sequence_uid"],
+        enable_rna_template: bool = False,
         template_dropout_rate: float = 0.0,
         stage: str = "train",
         kalign_binary_path: str = "",
@@ -253,17 +339,26 @@ class TemplateFeaturizer:
         assert len(prot_template_raw_paths) == len(
             prot_seq_or_filename_to_templatedir_jsons
         ), "Mismatch between raw paths and JSON mapping files."
+        assert len(rna_template_raw_paths) == len(
+            rna_seq_or_filename_to_templatedir_jsons
+        ), "Mismatch between RNA raw paths and JSON mapping files."
         assert len(kalign_binary_path) > 0, "kalign_binary_path must be provided."
         assert len(release_dates_path) > 0, "release_dates_path must be provided."
         assert len(obsolete_pdbs_path) > 0, "obsolete_pdbs_path must be provided."
         assert len(prot_template_raw_paths) == len(
             prot_indexing_methods
         ), "Mismatch between raw paths and indexing methods."
+        assert len(rna_template_raw_paths) == len(
+            rna_indexing_methods
+        ), "Mismatch between RNA raw paths and indexing methods."
 
         # Currently, multiple source training strategy is not determined
         assert (
             len(prot_template_raw_paths) == 1
         ), "Only single source template supported."
+        assert (
+            len(rna_template_raw_paths) == 1
+        ), "Only single source RNA template supported."
 
         if stage != "train":
             max_template_date = "2021-09-30"
@@ -277,24 +372,50 @@ class TemplateFeaturizer:
         self.max_template_date = datetime.strptime(max_template_date, "%Y-%m-%d")
         self.dataset_name = dataset_name
         self.enable_prot_template = enable_prot_template
+        self.enable_rna_template = enable_rna_template
         self.template_dropout_rate = template_dropout_rate
 
-        # Initialize source manager
-        mappings = {
+        if not rna_template_mmcif_dir:
+            rna_template_mmcif_dir = prot_template_mmcif_dir
+        if rna_template_cache_dir is None:
+            rna_template_cache_dir = prot_template_cache_dir
+
+        # Initialize source managers
+        prot_mappings = {
             i: load_json_cached(p)
             for i, p in enumerate(prot_seq_or_filename_to_templatedir_jsons)
         }
-        self.source_mgr = TemplateSourceManager(
+        rna_mappings = {
+            i: load_json_cached(p)
+            for i, p in enumerate(rna_seq_or_filename_to_templatedir_jsons)
+        }
+        self.prot_source_mgr = TemplateSourceManager(
             raw_paths=prot_template_raw_paths,
             indexing_methods=prot_indexing_methods,
-            mappings=mappings,
+            mappings=prot_mappings,
             enabled=enable_prot_template,
         )
+        self.rna_source_mgr = TemplateSourceManager(
+            raw_paths=rna_template_raw_paths,
+            indexing_methods=rna_indexing_methods,
+            mappings=rna_mappings,
+            enabled=enable_rna_template,
+        )
 
-        # Initialize online featurizer
-        self.online_featurizer = TemplateHitFeaturizer(
+        # Initialize online featurizers
+        self.prot_online_featurizer = TemplateHitFeaturizer(
             mmcif_dir=prot_template_mmcif_dir,
             template_cache_dir=prot_template_cache_dir,
+            max_hits=None if self.stage == "train" else 4,
+            kalign_binary_path=kalign_binary_path,
+            max_template_date=max_template_date,
+            release_dates_path=release_dates_path,
+            obsolete_pdbs_path=obsolete_pdbs_path,
+            _shuffle_top_k_prefiltered=20 if self.stage == "train" else None,
+        )
+        self.rna_online_featurizer = TemplateHitFeaturizer(
+            mmcif_dir=rna_template_mmcif_dir,
+            template_cache_dir=rna_template_cache_dir,
             max_hits=None if self.stage == "train" else 4,
             kalign_binary_path=kalign_binary_path,
             max_template_date=max_template_date,
@@ -309,6 +430,46 @@ class TemplateFeaturizer:
             "selected_templates": 0,
             "chain_profiles": [],
         }
+
+    def _get_manager_and_featurizer(
+        self, chain_entity_type: str
+    ) -> Tuple[Optional[TemplateSourceManager], Optional[TemplateHitFeaturizer]]:
+        """Returns the source manager and online featurizer for a chain type."""
+        if chain_entity_type == PROTEIN_CHAIN:
+            if not self.enable_prot_template:
+                return None, None
+            return self.prot_source_mgr, self.prot_online_featurizer
+        if chain_entity_type == RNA_CHAIN:
+            if not self.enable_rna_template:
+                return None, None
+            return self.rna_source_mgr, self.rna_online_featurizer
+        return None, None
+
+    @staticmethod
+    def _parse_rna_template_hits(
+        query_sequence: str,
+        sequence_uid: str,
+        path: str,
+        content: str,
+    ) -> List[Any]:
+        """Parses RNA template hits from a CSV or M8 file."""
+        parser = (
+            RNATemplateTableParser.parse_csv
+            if path.endswith(".csv")
+            else RNATemplateTableParser.parse_m8
+        )
+        parser_kwargs = {"csv_str": content} if path.endswith(".csv") else {"m8_str": content}
+        try:
+            return parser(query_seq=query_sequence, **parser_kwargs)
+        except ValueError as err:
+            try:
+                return parser(
+                    query_seq=query_sequence,
+                    query_id=sequence_uid,
+                    **parser_kwargs,
+                )
+            except ValueError:
+                raise err
 
     def get_template(
         self,
@@ -331,24 +492,21 @@ class TemplateFeaturizer:
         Returns:
             A tuple of (template_features_list, raw_hit_count, timing_track).
         """
-        if not self.enable_prot_template or chain_entity_type != PROTEIN_CHAIN:
+        source_mgr, online_featurizer = self._get_manager_and_featurizer(
+            chain_entity_type
+        )
+        if source_mgr is None or online_featurizer is None:
             return [], 0, {}
 
         # Fetch template paths from sources
-        template_paths = self.source_mgr.fetch_template_paths(
-            pdb_id, query_sequence, chain_entity_type
+        template_paths = source_mgr.fetch_template_paths(
+            pdb_id,
+            query_sequence,
+            chain_entity_type,
+            sequence_uid,
         )
-
-        hmmsearched_a3m, hmmsearched_hhr = "", ""
-        for path in template_paths:
-            with open(path, "r") as f:
-                content = f.read()
-            if not content:
-                continue
-            if path.endswith(".a3m"):
-                hmmsearched_a3m += content
-            elif path.endswith(".hhr"):
-                hmmsearched_hhr += content
+        if not template_paths:
+            return [], 0, {}
 
         # Determine cutoff date for filtering templates
         if query_release_date is None:
@@ -359,24 +517,53 @@ class TemplateFeaturizer:
                 query_release_date - timedelta(days=DAYS_BEFORE_QUERY_DATE),
             )
 
-        # Parse hits from a3m or hhr content
-        if hmmsearched_hhr:
-            hits = HHRParser.parse(hhr_string=hmmsearched_hhr)
+        hits = []
+        if chain_entity_type == PROTEIN_CHAIN:
+            hmmsearched_a3m, hmmsearched_hhr = "", ""
+            for path in template_paths:
+                with open(path, "r") as f:
+                    content = f.read()
+                if not content:
+                    continue
+                if path.endswith(".a3m"):
+                    hmmsearched_a3m += content
+                elif path.endswith(".hhr"):
+                    hmmsearched_hhr += content
+
+            # Parse hits from a3m or hhr content
+            if hmmsearched_hhr:
+                hits = HHRParser.parse(hhr_string=hmmsearched_hhr)
+            else:
+                hits = HmmsearchA3MParser.parse(
+                    query_seq=query_sequence, a3m_str=hmmsearched_a3m, skip_first=False
+                )
         else:
-            hits = HmmsearchA3MParser.parse(
-                query_seq=query_sequence, a3m_str=hmmsearched_a3m, skip_first=False
-            )
+            for path in template_paths:
+                with open(path, "r") as f:
+                    content = f.read()
+                if not content:
+                    continue
+                if path.endswith((".csv", ".m8")):
+                    hits.extend(
+                        self._parse_rna_template_hits(
+                            query_sequence=query_sequence,
+                            sequence_uid=sequence_uid,
+                            path=path,
+                            content=content,
+                        )
+                    )
 
         raw_hit_count = len(hits)
         if raw_hit_count == 0:
             return [], 0, {}
 
         # Process hits into features using the online featurizer
-        result, time_track = self.online_featurizer.get_templates(
+        result, time_track = online_featurizer.get_templates(
             sequence_uid=sequence_uid,
             query_sequence=query_sequence,
             hits=hits,
             max_template_date=cutoff_date,
+            query_chain_type=chain_entity_type,
         )
         return result.features, raw_hit_count, time_track
 
@@ -450,7 +637,7 @@ class TemplateFeaturizer:
             drop_template = np.random.uniform(0, 1) < self.template_dropout_rate
 
         template_meta_infos = {}
-        seq_to_templates_cache: Dict[str, Tuple[List[Dict], int, Dict]] = {}
+        seq_to_templates_cache: Dict[Any, Tuple[List[Dict], int, Dict]] = {}
         profile = {
             "elapsed_seconds": 0.0,
             "raw_templates": 0,
@@ -466,30 +653,43 @@ class TemplateFeaturizer:
             chain_type = poly_types_mapping.get(
                 entity_poly_type.get(eid, "non-polymer"), LIGAND_CHAIN_TYPES
             )
+            sequence_uid = f"{pdb_id}_{aid}"
 
-            if drop_template or chain_type != PROTEIN_CHAIN:
+            if drop_template or chain_type not in {PROTEIN_CHAIN, RNA_CHAIN}:
                 templates, raw_hit_count, time_track = [], 0, {}
             else:
-                if sequence in seq_to_templates_cache:
-                    templates, raw_hit_count, time_track = seq_to_templates_cache[
-                        sequence
-                    ]
+                source_mgr, _ = self._get_manager_and_featurizer(chain_type)
+                if source_mgr is None:
+                    templates, raw_hit_count, time_track = [], 0, {}
                 else:
-                    templates, raw_hit_count, time_track = self.get_template(
-                        pdb_id=pdb_id,
-                        query_sequence=sequence,
-                        sequence_uid=f"{pdb_id}_{aid}",
-                        query_release_date=query_release_date,
-                        chain_entity_type=chain_type,
+                    cache_key = (
+                        chain_type,
+                        *source_mgr.get_cache_key(
+                            pdb_id=pdb_id,
+                            query_sequence=sequence,
+                            sequence_uid=sequence_uid,
+                        ),
                     )
-                    seq_to_templates_cache[sequence] = (
-                        templates,
-                        raw_hit_count,
-                        time_track,
-                    )
+                    if cache_key in seq_to_templates_cache:
+                        templates, raw_hit_count, time_track = seq_to_templates_cache[
+                            cache_key
+                        ]
+                    else:
+                        templates, raw_hit_count, time_track = self.get_template(
+                            pdb_id=pdb_id,
+                            query_sequence=sequence,
+                            sequence_uid=sequence_uid,
+                            query_release_date=query_release_date,
+                            chain_entity_type=chain_type,
+                        )
+                        seq_to_templates_cache[cache_key] = (
+                            templates,
+                            raw_hit_count,
+                            time_track,
+                        )
 
             chain_id = atom_array.chain_id[atom_array.asym_id_int == aid][0]
-            if chain_type == PROTEIN_CHAIN:
+            if chain_type in {PROTEIN_CHAIN, RNA_CHAIN}:
                 num_sel = len(templates) if isinstance(templates, list) else 0
                 profile["raw_templates"] += raw_hit_count
                 profile["selected_templates"] += num_sel
@@ -670,7 +870,13 @@ class InferenceTemplateFeaturizer:
         curr_asym_id = 0
 
         for eid, info in enumerate(bioassembly):
-            seq, count, ctype, t_path = "", 0, LIGAND_CHAIN_TYPES, ""
+            seq, count, ctype, t_path, template_query_id = (
+                "",
+                0,
+                LIGAND_CHAIN_TYPES,
+                "",
+                None,
+            )
 
             if "proteinChain" in info:
                 c = info["proteinChain"]
@@ -682,7 +888,13 @@ class InferenceTemplateFeaturizer:
                 )
             elif "rnaSequence" in info:
                 c = info["rnaSequence"]
-                seq, count, ctype = c["sequence"], c["count"], RNA_CHAIN
+                seq, count, ctype, t_path, template_query_id = (
+                    c["sequence"],
+                    c["count"],
+                    RNA_CHAIN,
+                    c.get("templatesPath", ""),
+                    c.get("templateQueryId"),
+                )
             elif "dnaSequence" in info:
                 c = info["dnaSequence"]
                 seq, count, ctype = c["sequence"], c["count"], DNA_CHAIN
@@ -692,24 +904,38 @@ class InferenceTemplateFeaturizer:
 
             templates = []
             if t_path and use_template and online_template_featurizer:
-                assert ctype == PROTEIN_CHAIN, "Only protein templates are supported."
                 with open(t_path, "r") as f:
                     content = f.read()
 
-                if t_path.endswith(".hhr"):
+                if ctype == PROTEIN_CHAIN and t_path.endswith(".hhr"):
                     hits = HHRParser.parse(hhr_string=content)
-                elif t_path.endswith(".a3m"):
+                elif ctype == PROTEIN_CHAIN and t_path.endswith(".a3m"):
                     hits = HmmsearchA3MParser.parse(
                         query_seq=seq, a3m_str=content, skip_first=False
                     )
+                elif ctype == RNA_CHAIN and t_path.endswith(".csv"):
+                    hits = RNATemplateTableParser.parse_csv(
+                        query_seq=seq,
+                        csv_str=content,
+                        query_id=template_query_id,
+                    )
+                elif ctype == RNA_CHAIN and t_path.endswith(".m8"):
+                    hits = RNATemplateTableParser.parse_m8(
+                        query_seq=seq,
+                        m8_str=content,
+                        query_id=template_query_id,
+                    )
                 else:
-                    raise ValueError(f"Unsupported template format: {t_path}")
+                    raise ValueError(
+                        f"Unsupported template format for {ctype}: {t_path}"
+                    )
 
                 result, _ = online_template_featurizer.get_templates(
                     sequence_uid=seq,
                     query_sequence=seq,
                     hits=hits,
                     max_template_date=None,
+                    query_chain_type=ctype,
                 )
                 templates = result.features
                 logger.info(f"Found {len(templates)} templates for sequence {seq}")

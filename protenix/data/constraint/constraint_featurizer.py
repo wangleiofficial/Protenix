@@ -14,7 +14,9 @@
 
 import copy
 import hashlib
-from typing import Any
+import json
+from pathlib import Path
+from typing import Any, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -29,6 +31,82 @@ from protenix.data.utils import get_atom_mask_by_name
 from protenix.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+class ConstraintSourceManager:
+    """Resolves external constraint JSON paths from mapping files."""
+
+    def __init__(
+        self,
+        raw_paths: Sequence[str] = ("",),
+        seq_or_filename_to_constraint_jsons: Sequence[str] = (),
+        indexing_methods: Sequence[str] = ("sequence_uid",),
+    ) -> None:
+        self.raw_paths = list(raw_paths) if raw_paths else [""]
+        self.indexing_methods = list(indexing_methods) if indexing_methods else [
+            "sequence_uid"
+        ]
+        self._mapping_tables = []
+        for path in seq_or_filename_to_constraint_jsons:
+            with open(path, "r") as f:
+                mapping = json.load(f)
+            if not isinstance(mapping, dict):
+                raise ValueError(f"Constraint mapping must be a JSON object: {path}")
+            self._mapping_tables.append(mapping)
+
+    @staticmethod
+    def _get_lookup_key(
+        method: str,
+        query_sequence: str,
+        sequence_uid: str,
+    ) -> str:
+        if method == "sequence_uid":
+            return sequence_uid
+        if method == "sequence":
+            return query_sequence
+        raise ValueError(f"Unsupported constraint indexing method: {method}")
+
+    @staticmethod
+    def _resolve_mapping_entry(raw_root: str, entry: Any) -> Optional[str]:
+        if isinstance(entry, list):
+            if not entry:
+                return None
+            entry = entry[0]
+        entry_path = Path(str(entry))
+        candidates = []
+        if entry_path.is_absolute():
+            candidates.append(entry_path)
+        else:
+            if raw_root:
+                candidates.append(Path(raw_root) / entry_path)
+            candidates.append(entry_path)
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+            if candidate.is_dir():
+                for filename in ("constraint.json", "contact.json"):
+                    nested = candidate / filename
+                    if nested.is_file():
+                        return str(nested)
+        return None
+
+    def fetch_constraint_path(
+        self,
+        *,
+        query_sequence: str,
+        sequence_uid: str,
+    ) -> Optional[str]:
+        for raw_root in self.raw_paths:
+            for mapping in self._mapping_tables:
+                for method in self.indexing_methods:
+                    key = self._get_lookup_key(method, query_sequence, sequence_uid)
+                    if key not in mapping:
+                        continue
+                    resolved = self._resolve_mapping_entry(raw_root, mapping[key])
+                    if resolved is not None:
+                        return resolved
+        return None
 
 
 class ConstraintFeatureGenerator:
@@ -47,6 +125,41 @@ class ConstraintFeatureGenerator:
         self.ab_top2_clusters = ab_top2_clusters
 
     # function set for inference
+    @staticmethod
+    def _get_sequence_entity(
+        sequences: list[dict[str, Any]], entity_id: Any
+    ) -> tuple[str, dict[str, Any]]:
+        """Resolves an input entity ID to its sequence entry."""
+        entity_idx = int(entity_id) - 1
+        if entity_idx < 0 or entity_idx >= len(sequences):
+            raise ValueError(f"Invalid entity ID in contact constraint: {entity_id}")
+        type_to_entity = sequences[entity_idx]
+        if len(type_to_entity) != 1:
+            raise ValueError("Each sequence entry must contain exactly one entity type.")
+        return next(iter(type_to_entity.items()))
+
+    @staticmethod
+    def _allow_same_chain_rna_contact(
+        sequences: list[dict[str, Any]],
+        id1: list[Any],
+        id2: list[Any],
+    ) -> bool:
+        """Allows same-chain contact only for RNA inference inputs."""
+        if tuple(id1[:2]) != tuple(id2[:2]):
+            return False
+
+        entity_type, entity = ConstraintFeatureGenerator._get_sequence_entity(
+            sequences, id1[0]
+        )
+        if entity_type != "rnaSequence":
+            return False
+
+        if (id1[1] is None or id2[1] is None) and int(entity.get("count", 1)) > 1:
+            raise ValueError(
+                "Same-chain RNA contact requires explicit copy1/copy2 when count > 1."
+            )
+        return True
+
     @staticmethod
     def _canonicalize_contact_format(
         sequences: list[dict[str, Any]], pair: dict[str, Any]
@@ -76,7 +189,11 @@ class ConstraintFeatureGenerator:
                 res_info.append(identifier_value)
             _pair[f"id{id_num}"] = res_info
 
-        if hash(tuple(_pair["id1"][:2])) == hash(tuple(_pair["id2"][:2])):
+        if hash(tuple(_pair["id1"][:2])) == hash(tuple(_pair["id2"][:2])) and not (
+            ConstraintFeatureGenerator._allow_same_chain_rna_contact(
+                sequences, _pair["id1"], _pair["id2"]
+            )
+        ):
             raise ValueError("A contact pair can not be specified on the same chain")
 
         _pair["min_distance"] = float(pair.get("min_distance", 0))
@@ -195,6 +312,109 @@ class ConstraintFeatureGenerator:
                 "distance": distance.unique().item(),
             }
             logger.info(f"loaded pocket info:{pocket_info}")
+
+    @staticmethod
+    def _extract_contact_rows(constraint_payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """Extracts contact rows from either {'contact': [...]} or wrapped payloads."""
+        if "contact" in constraint_payload:
+            contact_rows = constraint_payload["contact"]
+        elif (
+            "constraint" in constraint_payload
+            and isinstance(constraint_payload["constraint"], dict)
+            and "contact" in constraint_payload["constraint"]
+        ):
+            contact_rows = constraint_payload["constraint"]["contact"]
+        else:
+            raise ValueError("Constraint payload must contain a 'contact' field.")
+        if not isinstance(contact_rows, list):
+            raise ValueError("Constraint payload 'contact' field must be a list.")
+        return contact_rows
+
+    @staticmethod
+    def _build_external_rna_contact_specifics(
+        token_array: TokenArray,
+        atom_array: AtomArray,
+        constraint_payload: dict[str, Any],
+    ) -> list[tuple[torch.Tensor, torch.Tensor, float, float]]:
+        """Builds token-level same-chain RNA contact specifics from predicted SS JSON."""
+        centre_atom_indices = token_array.get_annotation("centre_atom_index")
+        centre_atoms = atom_array[centre_atom_indices]
+
+        if len(np.unique(centre_atoms.asym_id_int)) != 1 or not np.all(centre_atoms.is_rna):
+            raise ValueError(
+                "External RNA SS constraints require a single-chain RNA sample."
+            )
+
+        chain_length = len(token_array)
+        specifics = []
+        for row in ConstraintFeatureGenerator._extract_contact_rows(constraint_payload):
+            position1 = int(row["position1"])
+            position2 = int(row["position2"])
+            if position1 < 1 or position1 > chain_length:
+                raise ValueError(
+                    f"position1={position1} is out of range for RNA chain length {chain_length}."
+                )
+            if position2 < 1 or position2 > chain_length:
+                raise ValueError(
+                    f"position2={position2} is out of range for RNA chain length {chain_length}."
+                )
+            specifics.append(
+                (
+                    torch.tensor([position1 - 1], dtype=torch.long),
+                    torch.tensor([position2 - 1], dtype=torch.long),
+                    float(row["max_distance"]),
+                    float(row.get("min_distance", 0.0)),
+                )
+            )
+        return specifics
+
+    def _generate_external_rna_contact_features(
+        self,
+        atom_array: AtomArray,
+        token_array: TokenArray,
+        generator: torch.Generator,
+        constraint_payload: dict[str, Any],
+    ) -> tuple[torch.Tensor, set[int]]:
+        """Generates token-level same-chain RNA contact features from predicted SS."""
+        feature_type = self.constraint.get("contact", {}).get("feature_type", "continuous")
+        if feature_type != "continuous":
+            raise ValueError(
+                "External RNA SS constraints currently require contact.feature_type='continuous'."
+            )
+
+        contact_featurizer = ContactFeaturizer(
+            token_array=token_array,
+            atom_array=atom_array,
+            generator=generator,
+        )
+        contact_specifics = self._build_external_rna_contact_specifics(
+            token_array=token_array,
+            atom_array=atom_array,
+            constraint_payload=constraint_payload,
+        )
+        return contact_featurizer.generate_spec_constraint(
+            contact_specifics=contact_specifics,
+            feature_type=feature_type,
+        )
+
+    @staticmethod
+    def _merge_contact_constraint_features(
+        base_feature: torch.Tensor,
+        extra_feature: torch.Tensor,
+    ) -> torch.Tensor:
+        """Merges additional continuous contact constraints into an existing feature tensor."""
+        if base_feature.shape != extra_feature.shape:
+            raise ValueError(
+                "base_feature and extra_feature must have the same shape for merging."
+            )
+        if base_feature.dim() != 3 or base_feature.shape[-1] != 2:
+            raise ValueError(
+                "External RNA SS constraints only support continuous contact tensors."
+            )
+        merged = base_feature.clone()
+        extra_mask = extra_feature[..., 1] > 0
+        merged[extra_mask] = extra_feature[extra_mask]
+        return merged
 
     @staticmethod
     def generate_from_json(
@@ -408,6 +628,7 @@ class ConstraintFeatureGenerator:
         msa_features: dict[str, np.ndarray],
         max_entity_mol_id: int,
         full_atom_array: AtomArray,
+        external_rna_contact_payload: Optional[dict[str, Any]] = None,
     ) -> tuple[
         TokenArray,
         AtomArray,
@@ -507,6 +728,22 @@ class ConstraintFeatureGenerator:
             features_dict,
             pdb_indice,
         )
+
+        if external_rna_contact_payload is not None:
+            (
+                external_contact_constraint_feature,
+                external_tokens_w_contact,
+            ) = self._generate_external_rna_contact_features(
+                atom_array=atom_array,
+                token_array=token_array,
+                generator=constraint_generator,
+                constraint_payload=external_rna_contact_payload,
+            )
+            contact_constraint_feature = self._merge_contact_constraint_features(
+                contact_constraint_feature,
+                external_contact_constraint_feature,
+            )
+            tokens_w_contact |= external_tokens_w_contact
 
         # Generate substructure features
         (

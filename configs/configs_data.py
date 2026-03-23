@@ -39,6 +39,13 @@ default_test_configs = {
     "constraint": {
         "enable": False,
         "fix_seed": False,  # True means use use the same contact in each evaluation.
+        "rna_ss": {
+            "enable": False,
+            "raw_paths": ListValue([""]),
+            "seq_or_filename_to_ss_jsons": [],
+            "indexing_methods": ListValue(["sequence_uid"]),
+            "strict": False,
+        },
     },
 }
 
@@ -71,6 +78,13 @@ default_weighted_pdb_configs = {
     "constraint": {
         "enable": False,
         "fix_seed": False,
+        "rna_ss": {
+            "enable": False,
+            "raw_paths": ListValue([""]),
+            "seq_or_filename_to_ss_jsons": [],
+            "indexing_methods": ListValue(["sequence_uid"]),
+            "strict": False,
+        },
         "pocket": {
             "prob": 0.0,
             "size": 1 / 3,
@@ -230,6 +244,7 @@ data_configs = {
     },
     "template": {
         "enable_prot_template": True,
+        "enable_rna_template": False,
         "template_dropout_rate": 0.0,
         "prot_template_mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
         "prot_template_cache_dir": "",
@@ -240,6 +255,11 @@ data_configs = {
             [os.path.join(PROTENIX_ROOT_DIR, "common/seq_to_pdb_index.json")]
         ),
         "prot_indexing_methods": ListValue(["sequence"]),
+        "rna_template_mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+        "rna_template_cache_dir": "",
+        "rna_template_raw_paths": ListValue([""]),
+        "rna_seq_or_filename_to_templatedir_jsons": ListValue([""]),
+        "rna_indexing_methods": ListValue(["sequence_uid"]),
         "release_dates_path": os.path.join(
             PROTENIX_ROOT_DIR, "common/release_date_cache.json"
         ),

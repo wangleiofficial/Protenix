@@ -28,7 +28,10 @@ from ml_collections.config_dict import ConfigDict
 from torch.utils.data import Dataset
 
 from protenix.data.constants import EvaluationChainInterface
-from protenix.data.constraint.constraint_featurizer import ConstraintFeatureGenerator
+from protenix.data.constraint.constraint_featurizer import (
+    ConstraintFeatureGenerator,
+    ConstraintSourceManager,
+)
 from protenix.data.core.featurizer import Featurizer
 from protenix.data.msa.msa_featurizer import MSAFeaturizer
 from protenix.data.pipeline.data_pipeline import DataPipeline
@@ -107,6 +110,7 @@ class BaseSingleDataset(Dataset):
         )  # Limit number of indices rows, mainly for test
         # Configs for constraint
         self.constraint = kwargs.get("constraint", {})
+        self.rna_ss_source_mgr = None
         if self.constraint.get("enable", False):
             logger.info(f"[{self.name}] constraint config: {self.constraint}")
             # Do not rely on new files for users who do not use constraint feature
@@ -114,6 +118,17 @@ class BaseSingleDataset(Dataset):
             self.constraint_generator = ConstraintFeatureGenerator(
                 self.constraint, self.ab_top2_clusters
             )
+            rna_ss_cfg = self.constraint.get("rna_ss", {})
+            if rna_ss_cfg.get("enable", False):
+                self.rna_ss_source_mgr = ConstraintSourceManager(
+                    raw_paths=rna_ss_cfg.get("raw_paths", [""]),
+                    seq_or_filename_to_constraint_jsons=rna_ss_cfg.get(
+                        "seq_or_filename_to_ss_jsons", []
+                    ),
+                    indexing_methods=rna_ss_cfg.get(
+                        "indexing_methods", ["sequence_uid"]
+                    ),
+                )
 
         self.error_dir = kwargs.get("error_dir", None)
         if self.error_dir is not None:
@@ -149,6 +164,44 @@ class BaseSingleDataset(Dataset):
                 if l:
                     pdb_filter_list.append(l)
         return pdb_filter_list
+
+    def _load_external_rna_ss_constraint(
+        self,
+        sample_indice: pd.core.series.Series,
+        token_array: TokenArray,
+        atom_array: AtomArray,
+    ) -> Optional[dict[str, Any]]:
+        """Loads an external predicted RNA secondary-structure constraint JSON."""
+        if self.rna_ss_source_mgr is None:
+            return None
+
+        centre_atom_indices = token_array.get_annotation("centre_atom_index")
+        centre_atoms = atom_array[centre_atom_indices]
+        if len(centre_atoms) == 0:
+            return None
+        if len(np.unique(centre_atoms.asym_id_int)) != 1 or not np.all(centre_atoms.is_rna):
+            return None
+
+        asym_id = int(np.unique(centre_atoms.asym_id_int)[0])
+        sequence_uid = f"{sample_indice.pdb_id}_{asym_id}"
+        if hasattr(centre_atoms, "cano_seq_resname"):
+            query_sequence = "".join(centre_atoms.cano_seq_resname.tolist())
+        else:
+            query_sequence = "".join(centre_atoms.res_name.tolist())
+        constraint_path = self.rna_ss_source_mgr.fetch_constraint_path(
+            query_sequence=query_sequence,
+            sequence_uid=sequence_uid,
+        )
+        if constraint_path is None:
+            if self.constraint.get("rna_ss", {}).get("strict", False):
+                raise FileNotFoundError(
+                    f"No external RNA SS constraint found for sequence_uid={sequence_uid}."
+                )
+            return None
+
+        with open(constraint_path, "r") as f:
+            payload = json.load(f)
+        return payload
 
     def read_indices_list(self, indices_fpath: Union[str, Path]) -> pd.DataFrame:
         """
@@ -703,6 +756,11 @@ class BaseSingleDataset(Dataset):
         sample_indice = self._get_sample_indice(idx=idx)
         pdb_indice = self._get_pdb_indice(idx=idx)
         features_dict = {}
+        external_rna_contact_payload = self._load_external_rna_ss_constraint(
+            sample_indice=sample_indice,
+            token_array=token_array,
+            atom_array=atom_array,
+        )
         (
             token_array,
             atom_array,
@@ -719,6 +777,7 @@ class BaseSingleDataset(Dataset):
             msa_features,
             max_entity_mol_id,
             full_atom_array,
+            external_rna_contact_payload=external_rna_contact_payload,
         )
         features_dict["constraint_feature"] = constraint_feature_dict
         features_dict.update(feature_info)

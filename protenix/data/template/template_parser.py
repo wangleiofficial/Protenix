@@ -14,6 +14,7 @@
 # Copyright 2021 AlQuraishi Laboratory
 
 import collections
+import csv
 import dataclasses
 import functools
 import io
@@ -41,6 +42,30 @@ MmCIFDict = Mapping[str, Sequence[str]]
 PdbHeader = Mapping[str, Any]
 ChainId = str
 SeqRes = str
+
+_RNA_MONOMER_TO_ONE_LETTER = {
+    "A": "A",
+    "G": "G",
+    "C": "C",
+    "U": "U",
+    "I": "N",
+    "N": "N",
+}
+_DNA_MONOMER_TO_ONE_LETTER = {
+    "DA": "A",
+    "DG": "G",
+    "DC": "C",
+    "DT": "T",
+    "DU": "T",
+    "DI": "N",
+    "DN": "N",
+}
+_SUPPORTED_TEMPLATE_POLYMER_TYPES = {
+    "polypeptide(l)": PROTEIN_CHAIN,
+    "polypeptide(d)": PROTEIN_CHAIN,
+    "polyribonucleotide": RNA_CHAIN,
+    "polydeoxyribonucleotide": DNA_CHAIN,
+}
 
 
 # --- Exceptions ---
@@ -138,6 +163,7 @@ class MmcifObject:
     structure: PDB.Structure.Structure
     chain_to_seqres: Mapping[ChainId, SeqRes]
     seqres_to_structure: Mapping[ChainId, Mapping[int, ResidueAtPosition]]
+    mmcif_to_author_chain_id: Mapping[ChainId, ChainId]
     raw_string: Any
 
 
@@ -323,8 +349,10 @@ class TemplateParser:
         ]
 
     @staticmethod
-    def _get_protein_chains(parsed_info: MmCIFDict) -> Dict[ChainId, Sequence[Monomer]]:
-        """Extracts valid protein chains and their sequences."""
+    def _get_supported_polymer_chains(
+        parsed_info: MmCIFDict,
+    ) -> Dict[ChainId, Tuple[Sequence[Monomer], str]]:
+        """Extracts supported polymer chains and their sequences."""
         entity_poly_seqs = TemplateParser._mmcif_loop_to_list(
             "_entity_poly_seq.", parsed_info
         )
@@ -337,8 +365,8 @@ class TemplateParser:
                 )
             )
 
-        chem_comps = TemplateParser._mmcif_loop_to_dict(
-            "_chem_comp.", "_chem_comp.id", parsed_info
+        entity_poly = TemplateParser._mmcif_loop_to_dict(
+            "_entity_poly.", "_entity_poly.entity_id", parsed_info
         )
         struct_asyms = TemplateParser._mmcif_loop_to_list("_struct_asym.", parsed_info)
 
@@ -350,15 +378,34 @@ class TemplateParser:
 
         valid_chains = {}
         for entity_id, seq_info in polymers.items():
-            # Check if any component is peptide-like.
-            is_protein = any(
-                "peptide" in chem_comps.get(m.id, {}).get("_chem_comp.type", "")
-                for m in seq_info
-            )
-            if is_protein:
+            poly_type = entity_poly.get(entity_id, {}).get("_entity_poly.type", "")
+            chain_type = _SUPPORTED_TEMPLATE_POLYMER_TYPES.get(poly_type.lower())
+            if chain_type is not None:
                 for chain_id in entity_to_mmcif_chains[entity_id]:
-                    valid_chains[chain_id] = seq_info
+                    valid_chains[chain_id] = (seq_info, chain_type)
         return valid_chains
+
+    @staticmethod
+    def _monomer_to_one_letter(monomer_id: str, chain_type: str) -> str:
+        """Maps a monomer identifier to a canonical one-letter residue code."""
+        monomer_id = monomer_id.upper()
+        if chain_type == PROTEIN_CHAIN:
+            letter = PDBData.protein_letters_3to1.get(monomer_id, "X")
+            return letter if len(letter) == 1 else "X"
+        if chain_type == RNA_CHAIN:
+            return _RNA_MONOMER_TO_ONE_LETTER.get(monomer_id, "N")
+        if chain_type == DNA_CHAIN:
+            return _DNA_MONOMER_TO_ONE_LETTER.get(monomer_id, "N")
+        raise NotImplementedError(f"Unsupported chain type: {chain_type}")
+
+    @staticmethod
+    def _get_chain_sequence(
+        seq_info: Sequence[Monomer], chain_type: str
+    ) -> str:
+        """Converts a polymer chain from monomer IDs to a canonical one-letter sequence."""
+        return "".join(
+            [TemplateParser._monomer_to_one_letter(monomer.id, chain_type) for monomer in seq_info]
+        )
 
     @staticmethod
     def _is_set(data: str) -> bool:
@@ -388,12 +435,15 @@ class TemplateParser:
                     parsed_info[k] = [v]
 
             header = TemplateParser._get_header(parsed_info)
-            valid_chains = TemplateParser._get_protein_chains(parsed_info)
+            valid_chains = TemplateParser._get_supported_polymer_chains(parsed_info)
             if not valid_chains:
-                return ParsingResult(None, {(file_id, ""): "No protein chains found."})
+                return ParsingResult(
+                    None, {(file_id, ""): "No supported polymer chains found."}
+                )
 
             seq_start_num = {
-                cid: min(m.num for m in seq) for cid, seq in valid_chains.items()
+                cid: min(m.num for m in seq_info)
+                for cid, (seq_info, _) in valid_chains.items()
             }
             mmcif_to_author_chain_id = {}
             seq_to_structure_mappings = collections.defaultdict(dict)
@@ -443,6 +493,7 @@ class TemplateParser:
                     continue
                 auth_cid = mmcif_to_author_chain_id[cid]
                 mapping = seq_to_structure_mappings[auth_cid]
+                seq_info, _ = valid_chains[cid]
                 for idx, monomer in enumerate(seq_info):
                     if idx not in mapping:
                         mapping[idx] = ResidueAtPosition(
@@ -451,18 +502,11 @@ class TemplateParser:
 
             # Convert 3-letter to 1-letter sequences.
             auth_chain_to_seq = {}
-            for cid, seq_info in valid_chains.items():
+            for cid, (seq_info, chain_type) in valid_chains.items():
                 if cid not in mmcif_to_author_chain_id:
                     continue
                 auth_cid = mmcif_to_author_chain_id[cid]
-                seq = "".join(
-                    [
-                        PDBData.protein_letters_3to1.get(monomer.id, "X")
-                        for monomer in seq_info
-                    ]
-                )
-                # Ensure it's 1-letter.
-                seq = "".join([c if len(c) == 1 else "X" for c in seq])
+                seq = TemplateParser._get_chain_sequence(seq_info, chain_type)
                 auth_chain_to_seq[auth_cid] = seq
 
             mmcif_obj = MmcifObject(
@@ -471,6 +515,7 @@ class TemplateParser:
                 structure=first_model,
                 chain_to_seqres=auth_chain_to_seq,
                 seqres_to_structure=seq_to_structure_mappings,
+                mmcif_to_author_chain_id=mmcif_to_author_chain_id,
                 raw_string=parsed_info,
             )
             return ParsingResult(mmcif_object=mmcif_obj, errors=errors)
@@ -660,3 +705,111 @@ class HmmsearchA3MParser:
         return HitMetadata(
             match[1], match[2], int(match[3]), int(match[4]), int(match[5]), match[6]
         )
+
+
+class RNATemplateTableParser:
+    """Parses RNA template hits from CSV or M8 tables."""
+
+    @staticmethod
+    def parse_csv(
+        query_seq: str,
+        csv_str: str,
+        query_id: Optional[str] = None,
+    ) -> List[TemplateHit]:
+        """Parses RNA template hits from a CSV table."""
+        reader = csv.DictReader(io.StringIO(csv_str))
+        rows = list(reader)
+        return RNATemplateTableParser._rows_to_hits(
+            query_seq=query_seq, rows=rows, query_id=query_id
+        )
+
+    @staticmethod
+    def parse_m8(
+        query_seq: str,
+        m8_str: str,
+        query_id: Optional[str] = None,
+    ) -> List[TemplateHit]:
+        """Parses RNA template hits from an m8 table."""
+        rows = []
+        for line in m8_str.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split()
+            if len(fields) < 12:
+                raise ValueError(f"Invalid m8 line with fewer than 12 columns: {line}")
+            rows.append(
+                {
+                    "query": fields[0],
+                    "target": fields[1],
+                    "fident": fields[2],
+                    "alnlen": fields[3],
+                    "mismatch": fields[4],
+                    "gapopen": fields[5],
+                    "qstart": fields[6],
+                    "qend": fields[7],
+                    "tstart": fields[8],
+                    "tend": fields[9],
+                    "evalue": fields[10],
+                    "bits": fields[11],
+                }
+            )
+        return RNATemplateTableParser._rows_to_hits(
+            query_seq=query_seq, rows=rows, query_id=query_id
+        )
+
+    @staticmethod
+    def _rows_to_hits(
+        query_seq: str,
+        rows: Sequence[Mapping[str, str]],
+        query_id: Optional[str] = None,
+    ) -> List[TemplateHit]:
+        """Converts table rows into normalized TemplateHit objects."""
+        if not rows:
+            return []
+
+        if query_id is None:
+            query_ids = {row["query"] for row in rows}
+            if len(query_ids) > 1:
+                raise ValueError(
+                    "RNA template table contains multiple query IDs. "
+                    "Provide a query-specific file or set templateQueryId."
+                )
+            query_id = next(iter(query_ids))
+
+        filtered_rows = [row for row in rows if row["query"] == query_id]
+        if not filtered_rows:
+            raise ValueError(f"No RNA template hits found for query ID: {query_id}")
+
+        hits = []
+        for i, row in enumerate(filtered_rows, start=1):
+            pdb_id, chain_id = RNATemplateTableParser._parse_target(row["target"])
+            hits.append(
+                TemplateHit(
+                    index=i,
+                    name=f"{pdb_id}_{chain_id}",
+                    aligned_cols=int(row["alnlen"]),
+                    sum_probs=float(row["bits"]),
+                    query=query_seq,
+                    hit_sequence="",
+                    indices_query=[],
+                    indices_hit=[],
+                )
+            )
+        return hits
+
+    @staticmethod
+    def _parse_target(target: str) -> Tuple[str, str]:
+        """Normalizes an RNA template table target into pdb_id and auth chain ID."""
+        target = target.strip()
+        if len(target) < 6 or "_" not in target:
+            raise ValueError(f"Invalid RNA template target: {target}")
+
+        pdb_id = target[:4].lower()
+        if not re.fullmatch(r"[a-zA-Z0-9]{4}", pdb_id):
+            raise ValueError(f"Invalid RNA template target PDB ID: {target}")
+
+        chain_id = target.rsplit("_", 1)[-1]
+        if not chain_id:
+            raise ValueError(f"Invalid RNA template target chain ID: {target}")
+        return pdb_id, chain_id

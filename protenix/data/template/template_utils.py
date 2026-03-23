@@ -30,8 +30,11 @@ from typing_extensions import Final, TypeAlias
 from protenix.data.constants import (
     ATOM37_NUM,
     ATOM37_ORDER,
+    DENSE_ATOM,
+    DNA_CHAIN,
     PROTEIN_AATYPE_DENSE_ATOM_TO_ATOM37,
     PROTEIN_CHAIN,
+    RNA_CHAIN,
     RESTYPE_PSEUDOBETA_INDEX,
     RESTYPE_RIGIDGROUP_DENSE_ATOM_IDX,
     STD_RESIDUES_WITH_GAP,
@@ -77,10 +80,14 @@ TEMPLATE_FEATURES: Final[Tuple[str, ...]] = (
     "template_atom_mask",
 )
 
-_POLYMER_FEATURES: Final[Mapping[str, Union[np.float64, np.int32, object]]] = {
+MAX_TEMPLATE_DENSE_ATOMS: Final[int] = max(len(v) for v in DENSE_ATOM.values())
+
+_STACKABLE_TEMPLATE_FEATURES: Final[Mapping[str, Union[np.float64, np.int32, object]]] = {
     "template_aatype": np.int32,
     "template_all_atom_masks": np.float64,
     "template_all_atom_positions": np.float64,
+    "template_atom_mask": np.float64,
+    "template_atom_positions": np.float64,
     "template_domain_names": object,
     "template_release_date": object,
     "template_sequence": object,
@@ -113,7 +120,12 @@ class TemplateFeatures:
         *, hit_features: Sequence[Mapping[str, Any]]
     ) -> Mapping[str, Any]:
         """Stacks polymer features, adds empty and keeps ligand features unstacked."""
-        features_to_include = set(_POLYMER_FEATURES)
+        if not hit_features:
+            return {}
+
+        features_to_include = set(_STACKABLE_TEMPLATE_FEATURES).intersection(
+            *(set(single_hit_features) for single_hit_features in hit_features)
+        )
         features = {
             feat: [single_hit_features[feat] for single_hit_features in hit_features]
             for feat in features_to_include
@@ -121,11 +133,11 @@ class TemplateFeatures:
 
         stacked_features = {}
         for k, v in features.items():
-            if k in _POLYMER_FEATURES:
+            if k in _STACKABLE_TEMPLATE_FEATURES:
                 v = (
                     np.stack(v, axis=0)
                     if v
-                    else np.array([], dtype=_POLYMER_FEATURES[k])
+                    else np.array([], dtype=_STACKABLE_TEMPLATE_FEATURES[k])
                 )
             stacked_features[k] = v
 
@@ -144,22 +156,29 @@ class TemplateFeatures:
                 for x in template_features["template_release_date"]
             ]
 
-            # Convert from atom37 to dense atom
-            dense_atom_indices = np.take(
-                PROTEIN_AATYPE_DENSE_ATOM_TO_ATOM37,
-                template_features["template_aatype"],
-                axis=0,
-            )
+            if "template_atom_positions" in template_features:
+                atom_mask = template_features["template_atom_mask"]
+                atom_positions = template_features["template_atom_positions"]
+                atom_positions = atom_positions * atom_mask[..., None]
+            else:
+                # Convert from atom37 to dense atom
+                dense_atom_indices = np.take(
+                    PROTEIN_AATYPE_DENSE_ATOM_TO_ATOM37,
+                    template_features["template_aatype"],
+                    axis=0,
+                )
 
-            atom_mask = np.take_along_axis(
-                template_features["template_all_atom_masks"], dense_atom_indices, axis=2
-            )
-            atom_positions = np.take_along_axis(
-                template_features["template_all_atom_positions"],
-                dense_atom_indices[..., None],
-                axis=2,
-            )
-            atom_positions *= atom_mask[..., None]
+                atom_mask = np.take_along_axis(
+                    template_features["template_all_atom_masks"],
+                    dense_atom_indices,
+                    axis=2,
+                )
+                atom_positions = np.take_along_axis(
+                    template_features["template_all_atom_positions"],
+                    dense_atom_indices[..., None],
+                    axis=2,
+                )
+                atom_positions *= atom_mask[..., None]
 
             template_features = {
                 "template_aatype": template_features["template_aatype"],
@@ -177,6 +196,7 @@ class TemplateFeatures:
     @staticmethod
     def empty_template_features(num_res: int, num_dense: int = 24) -> FeatureDict:
         """Creates fully masked out template features."""
+        num_dense = max(num_dense, MAX_TEMPLATE_DENSE_ATOMS)
         template_features = {
             "template_aatype": np.array(
                 [STD_RESIDUES_WITH_GAP["-"]] * num_res, dtype=np.int32
@@ -432,6 +452,37 @@ class TemplateHitProcessor:
 
         return cif_str
 
+    @staticmethod
+    def _canonical_nucleic_resname(chain_type: str, residue_letter: str) -> str:
+        """Maps a canonical nucleotide letter to the corresponding dense-atom residue name."""
+        residue_letter = residue_letter.upper()
+        if chain_type == RNA_CHAIN:
+            return residue_letter if residue_letter in DENSE_ATOM else "N"
+        if chain_type == DNA_CHAIN:
+            return {
+                "A": "DA",
+                "G": "DG",
+                "C": "DC",
+                "T": "DT",
+            }.get(residue_letter, "DN")
+        raise NotImplementedError(f"Unsupported chain type: {chain_type}")
+
+    @staticmethod
+    def _get_dense_residue_name(
+        chain_type: str,
+        residue_name: str,
+        residue_letter: str,
+    ) -> str:
+        """Resolves the dense-atom residue name for a template residue."""
+        residue_name = residue_name.upper()
+        if chain_type == PROTEIN_CHAIN:
+            return residue_name
+        if residue_name in DENSE_ATOM:
+            return residue_name
+        return TemplateHitProcessor._canonical_nucleic_resname(
+            chain_type, residue_letter
+        )
+
     def _get_atom_coords(
         self,
         mmcif_object: MmcifObject,
@@ -439,6 +490,7 @@ class TemplateHitProcessor:
         _zero_center_positions: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Extracts all-atom coordinates and mask for a specific chain."""
+        chain_id = self._resolve_author_chain_id(mmcif_object, chain_id)
         chains = list(mmcif_object.structure.get_chains())
         relevant_chains = [c for c in chains if c.id == chain_id]
         if len(relevant_chains) != 1:
@@ -497,6 +549,73 @@ class TemplateHitProcessor:
 
         return all_pos, all_mask
 
+    @staticmethod
+    def _resolve_author_chain_id(mmcif_object: MmcifObject, chain_id: str) -> str:
+        """Resolves a label_asym_id to author chain ID when needed."""
+        return mmcif_object.mmcif_to_author_chain_id.get(chain_id, chain_id)
+
+    def _get_dense_atom_coords(
+        self,
+        mmcif_object: MmcifObject,
+        chain_id: str,
+        chain_entity_type: str,
+        template_seq: str,
+        _zero_center_positions: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Extracts dense-atom coordinates and mask for nucleic acid chains."""
+        chain_id = self._resolve_author_chain_id(mmcif_object, chain_id)
+        chains = list(mmcif_object.structure.get_chains())
+        relevant_chains = [c for c in chains if c.id == chain_id]
+        if len(relevant_chains) != 1:
+            raise MultipleChainsError(
+                f"Expected 1 chain with id {chain_id}, found {len(relevant_chains)}"
+            )
+        chain = relevant_chains[0]
+
+        num_res = len(mmcif_object.chain_to_seqres[chain_id])
+        all_pos = np.zeros(
+            (num_res, MAX_TEMPLATE_DENSE_ATOMS, 3), dtype=np.float32
+        )
+        all_mask = np.zeros((num_res, MAX_TEMPLATE_DENSE_ATOMS), dtype=np.float32)
+
+        for i in range(num_res):
+            res_info = mmcif_object.seqres_to_structure[chain_id][i]
+            if res_info.is_missing:
+                continue
+            try:
+                res = chain[
+                    (
+                        res_info.hetflag,
+                        res_info.position.residue_number,
+                        res_info.position.insertion_code,
+                    )
+                ]
+            except KeyError:
+                continue
+
+            dense_res_name = self._get_dense_residue_name(
+                chain_type=chain_entity_type,
+                residue_name=res.get_resname(),
+                residue_letter=template_seq[i] if i < len(template_seq) else "N",
+            )
+            dense_atom_names = DENSE_ATOM.get(dense_res_name, ())
+            atom_name_to_idx = {name: idx for idx, name in enumerate(dense_atom_names)}
+
+            for atom in res.get_atoms():
+                atom_name = atom.get_name()
+                if atom_name in atom_name_to_idx:
+                    idx = atom_name_to_idx[atom_name]
+                    all_pos[i, idx] = atom.get_coord()
+                    all_mask[i, idx] = 1.0
+
+        if _zero_center_positions:
+            mask_bool = all_mask.astype(bool)
+            if np.any(mask_bool):
+                center = all_pos[mask_bool].mean(axis=0)
+                all_pos[mask_bool] -= center
+
+        return all_pos, all_mask
+
     def _check_residue_distances(
         self, pos: np.ndarray, mask: np.ndarray, max_dist: float
     ):
@@ -514,15 +633,60 @@ class TemplateHitProcessor:
                         )
                 prev_pos = curr_pos
 
+    def _check_dense_residue_distances(
+        self,
+        pos: np.ndarray,
+        mask: np.ndarray,
+        chain_entity_type: str,
+        template_seq: str,
+        max_dist: float,
+    ) -> None:
+        """Verifies that distance between consecutive dense backbone atoms is within limits."""
+        if chain_entity_type not in {RNA_CHAIN, DNA_CHAIN}:
+            return
+
+        prev_pos = None
+        for i, (p, m, residue_letter) in enumerate(zip(pos, mask, template_seq)):
+            dense_res_name = self._canonical_nucleic_resname(
+                chain_entity_type, residue_letter
+            )
+            dense_atom_names = DENSE_ATOM.get(dense_res_name, ())
+            if "C3'" not in dense_atom_names:
+                continue
+            atom_idx = dense_atom_names.index("C3'")
+            if m[atom_idx]:
+                curr_pos = p[atom_idx]
+                if prev_pos is not None:
+                    dist = np.linalg.norm(curr_pos - prev_pos)
+                    if dist > max_dist:
+                        raise CaDistanceError(
+                            f"Distance between residues {i} and previous is {dist:.2f} > {max_dist}"
+                        )
+                prev_pos = curr_pos
+
     def _get_atom_positions(
         self,
         mmcif_obj: MmcifObject,
         auth_chain_id: str,
+        chain_entity_type: str,
+        template_seq: str,
         max_ca_dist: float,
         _zero_center: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        pos, mask = self._get_atom_coords(mmcif_obj, auth_chain_id, _zero_center)
-        self._check_residue_distances(pos, mask, max_ca_dist)
+        if chain_entity_type == PROTEIN_CHAIN:
+            pos, mask = self._get_atom_coords(mmcif_obj, auth_chain_id, _zero_center)
+            self._check_residue_distances(pos, mask, max_ca_dist)
+        else:
+            pos, mask = self._get_dense_atom_coords(
+                mmcif_obj,
+                auth_chain_id,
+                chain_entity_type,
+                template_seq,
+                _zero_center,
+            )
+            self._check_dense_residue_distances(
+                pos, mask, chain_entity_type, template_seq, max_ca_dist
+            )
         return pos, mask
 
     def _align_query_to_hit_index_mapping(
@@ -552,7 +716,7 @@ class TemplateHitProcessor:
                     value: Residue index in the template sequence (0-based).
             actual_chain_id: The actual chain ID used from the mmCIF.
         """
-        aligner = Kalign(binary_path=self._kalign_binary_path)
+        chain_id = self._resolve_author_chain_id(mmcif_obj, chain_id)
         target_seq = mmcif_obj.chain_to_seqres.get(chain_id, "")
         actual_chain_id = chain_id
         if not target_seq:
@@ -562,6 +726,11 @@ class TemplateHitProcessor:
             else:
                 raise QueryToTemplateAlignError(f"Chain {chain_id} not found.")
 
+        if query_seq == target_seq:
+            mapping = {i: i for i in range(len(query_seq))}
+            return target_seq, mapping, actual_chain_id
+
+        aligner = Kalign(binary_path=self._kalign_binary_path)
         try:
             q_aln, t_aln = aligner.align([query_seq, target_seq])
         except Exception as e:
@@ -594,6 +763,7 @@ class TemplateHitProcessor:
         template_seq: str,
         query_seq: str,
         chain_id: str,
+        chain_entity_type: str,
         _zero_center: bool = True,
     ) -> Tuple[Dict[str, Any], Optional[str]]:
         """Generates features for a template hit."""
@@ -603,14 +773,22 @@ class TemplateHitProcessor:
         warning = None
         try:
             all_pos, all_mask = self._get_atom_positions(
-                mmcif_obj, chain_id, 150.0, _zero_center
+                mmcif_obj,
+                chain_id,
+                chain_entity_type,
+                template_seq,
+                150.0,
+                _zero_center,
             )
         except (CaDistanceError, KeyError) as e:
             raise NoAtomDataInTemplateError(f"Failed to get atom data: {e}")
 
         num_query = len(query_seq)
-        out_pos = np.zeros((num_query, ATOM37_NUM, 3), dtype=np.float32)
-        out_mask = np.zeros((num_query, ATOM37_NUM), dtype=np.float32)
+        num_atom = (
+            ATOM37_NUM if chain_entity_type == PROTEIN_CHAIN else MAX_TEMPLATE_DENSE_ATOMS
+        )
+        out_pos = np.zeros((num_query, num_atom, 3), dtype=np.float32)
+        out_mask = np.zeros((num_query, num_atom), dtype=np.float32)
         out_seq = ["-"] * num_query
 
         for q_idx, t_idx in mapping.items():
@@ -625,17 +803,28 @@ class TemplateHitProcessor:
             )
 
         out_seq_str = "".join(out_seq)
-        aatype = encode_template_restype(PROTEIN_CHAIN, out_seq_str)
+        aatype = encode_template_restype(chain_entity_type, out_seq_str)
 
-        features = {
-            "template_all_atom_positions": out_pos,
-            "template_all_atom_masks": out_mask,
-            "template_sequence": out_seq_str.encode(),
-            "template_aatype": np.array(aatype, dtype=np.int32),
-            "template_domain_names": np.array(
-                f"{pdb_id.lower()}_{chain_id}".encode(), dtype=object
-            ),
-        }
+        if chain_entity_type == PROTEIN_CHAIN:
+            features = {
+                "template_all_atom_positions": out_pos,
+                "template_all_atom_masks": out_mask,
+                "template_sequence": out_seq_str.encode(),
+                "template_aatype": np.array(aatype, dtype=np.int32),
+                "template_domain_names": np.array(
+                    f"{pdb_id.lower()}_{chain_id}".encode(), dtype=object
+                ),
+            }
+        else:
+            features = {
+                "template_atom_positions": out_pos,
+                "template_atom_mask": out_mask,
+                "template_sequence": out_seq_str.encode(),
+                "template_aatype": np.array(aatype, dtype=np.int32),
+                "template_domain_names": np.array(
+                    f"{pdb_id.lower()}_{chain_id}".encode(), dtype=object
+                ),
+            }
         return features, warning
 
     def _update_realigned_hit(
@@ -678,6 +867,7 @@ class TemplateHitProcessor:
         release_dates: Mapping[str, datetime],
         obsolete_pdbs: Mapping[str, str],
         strict: bool = False,
+        chain_entity_type: str = PROTEIN_CHAIN,
     ) -> Tuple[SingleHitResult, Dict[str, float]]:
         """Processes a single hit to generate features."""
         track = {}
@@ -700,7 +890,7 @@ class TemplateHitProcessor:
             try:
                 cif_str = self._fetch_or_read_cif(pdb_id)
                 res = TemplateParser.parse(
-                    file_id=pdb_id, mmcif_string=cif_str, auth_chain_id=chain_id
+                    file_id=pdb_id, mmcif_string=cif_str, auth_chain_id=None
                 )
                 track["load"] = time.time() - t_start
             except (FileNotFoundError, requests.RequestException) as e:
@@ -717,7 +907,7 @@ class TemplateHitProcessor:
 
         date_str = res.mmcif_object.header.get("release_date", "9999-12-31")
         hit_date = datetime.strptime(date_str, "%Y-%m-%d")
-        if hit_date > max_date:
+        if max_date is not None and hit_date > max_date:
             err = f"Hit {pdb_id} date {hit_date} > {max_date}"
             return (
                 SingleHitResult(None, None, err if strict else None, None),
@@ -745,6 +935,7 @@ class TemplateHitProcessor:
                 target_seq,
                 query_seq,
                 actual_chain_id,
+                chain_entity_type,
                 self._zero_center_positions,
             )
             feats["template_sum_probs"] = [
@@ -863,6 +1054,7 @@ class TemplateHitFeaturizer:
         query_sequence: str,
         hits: Sequence[TemplateHit],
         max_template_date: Optional[Union[str, datetime]] = None,
+        query_chain_type: str = PROTEIN_CHAIN,
     ) -> Tuple[TemplateSearchResult, Dict[str, float]]:
         """
         Processes hits to generate template features.
@@ -882,6 +1074,14 @@ class TemplateHitFeaturizer:
                 cutoff = datetime.strptime(max_template_date, "%Y-%m-%d")
             else:
                 cutoff = max_template_date
+
+        if query_chain_type in {RNA_CHAIN, DNA_CHAIN}:
+            return self._get_nucleic_templates(
+                query_sequence=query_sequence,
+                hits=hits,
+                cutoff=cutoff,
+                query_chain_type=query_chain_type,
+            )
 
         # Prefilter hits.
         valid_hits = []
@@ -942,6 +1142,74 @@ class TemplateHitFeaturizer:
                 self._release_dates,
                 self._obsolete_pdbs,
                 self._strict_error_check,
+            )
+            last_track = track
+            if res.error:
+                errors.append(res.error)
+            if res.warning:
+                warnings.append(res.warning)
+            if res.features:
+                seq_key = res.features["template_sequence"]
+                if seq_key not in already_seen_seqs:
+                    already_seen_seqs.add(seq_key)
+                    features.append(res.features)
+                    final_hits.append(res.hit)
+
+        return TemplateSearchResult(features, final_hits, errors, warnings), last_track
+
+    def _get_nucleic_templates(
+        self,
+        query_sequence: str,
+        hits: Sequence[TemplateHit],
+        cutoff: Optional[datetime],
+        query_chain_type: str,
+    ) -> Tuple[TemplateSearchResult, Dict[str, float]]:
+        """Processes RNA/DNA template hits without the protein-specific prefilter."""
+        errors, warnings = [], []
+        deduped = []
+        seen_names = set()
+        for hit in sorted(
+            hits,
+            key=lambda x: x.sum_probs if x.sum_probs is not None else 0.0,
+            reverse=True,
+        ):
+            if len(query_sequence) == 0:
+                continue
+            align_ratio = hit.aligned_cols / len(query_sequence)
+            if align_ratio <= 0.1:
+                warnings.append(
+                    f"Hit {hit.name} failed prefilter: Align ratio {align_ratio:.2f} <= 0.10"
+                )
+                continue
+            if hit.name in seen_names:
+                continue
+            seen_names.add(hit.name)
+            deduped.append(hit)
+
+        indices = list(range(len(deduped)))
+        if self._max_template_candidates_num:
+            indices = indices[: self._max_template_candidates_num]
+
+        max_to_collect = (
+            self._max_hits if self._max_hits is not None else min(4, len(indices))
+        )
+
+        features, final_hits = [], []
+        already_seen_seqs = set()
+        last_track = {}
+
+        for i in indices:
+            if len(features) >= max_to_collect:
+                break
+            hit = deduped[i]
+            res, track = self._hit_processor.process(
+                query_sequence,
+                hit,
+                cutoff,
+                self._release_dates,
+                self._obsolete_pdbs,
+                self._strict_error_check,
+                chain_entity_type=query_chain_type,
             )
             last_track = track
             if res.error:
