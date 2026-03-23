@@ -181,6 +181,8 @@ Data hierarchy after extraction should be as follows:
 
 Data processing scripts have also been released. you can refer to [prepare_training_data.md](./prepare_training_data.md) for generating `{dataset}_bioassembly` and `indices`. And you can refer to [msa_template_pipeline.md](./msa_template_pipeline.md) for pipelines to get `mmcif_msa_template` and `seq_to_pdb_index.json`.
 
+If you are preparing a **monomer RNA** training setup with RNA MSA, RNA templates, and predicted RNA secondary-structure constraints, see [RNA Training README](./rna_training_readme.md).
+
 ### Training demo
 After installation and data preparation, you can run the following command to train the model from scratch:
 
