@@ -38,7 +38,7 @@
 ## Data Preprocessing
 Execute the script to preprocess the data:
 ```bash
-python3 scripts/prepare_training_data.py -i [input_path] -o [output_csv] -b [output_dir] -c [cluster_txt] -n [num_cpu]
+python3 scripts/prepare_training_data.py -i [input_path] -o [output_csv] -b [output_dir] -c [cluster_txt] -n [num_cpu] [--rna-mode all|rna_monomer|rna_only|rna_all]
 ```
 
 The preprocessed structures will be saved as `.pkl.gz` files. Additionally, a `CSV` file will be generated to catalog the chains and interfaces within these structures, which will facilitate sampling during the training process.
@@ -60,6 +60,21 @@ Note that there is an optional parameter `-d` in the script. When this parameter
 - Removing chains with one-third of their heavy atoms colliding
 
 For CIF files generated through model inference where these filtering steps aren't desired, you can run the script with the `-d` parameter, which disables all these filters. The CIF structure will not be expanded to Assembly 1 in this case.
+
+### RNA-Specific Filtering
+
+When preparing an RNA-focused corpus from a mixed PDB collection, you can add
+`--rna-mode` to filter the generated rows and saved bioassemblies:
+
+- `--rna-mode rna_monomer`: extract every RNA chain into its own single-chain sample
+  and save it as `<pdb_id>_<asym_id_int>.pkl.gz`, even if the source assembly was an
+  RNA complex, RNA-protein complex, or DNA-RNA complex.
+- `--rna-mode rna_only`: keep RNA-only assemblies, including RNA monomers and
+  RNA-RNA complexes; output RNA chain rows and RNA-RNA interface rows.
+- `--rna-mode rna_all`: keep RNA-containing assemblies without DNA/hybrid polymer
+  chains; output RNA chain rows, RNA-RNA interface rows, and RNA-protein interface rows.
+
+The default is `--rna-mode all`, which preserves the original behavior with no RNA-specific filtering.
 
 
 ## Output Format
@@ -91,6 +106,7 @@ Each row contains information about a pre-processed chain or interface, and the 
 |----------------|------------|------------------------------------------------------------------------|----------|
 | type           | str        | "chain" or "interface"                                                 | Y        |
 | pdb_id         | str        | PDB Code (entry.id)                                                    | Y        |
+| bioassembly_name | str      | Optional file stem for locating the saved Bioassembly Dict `.pkl.gz`   | N        |
 | cluster_id     | str        | Cluster_id of the chain/interface                                      | Y        |
 | assembly_id    | str        | Assembly id                                                            | N        |
 | release_date   | str        | Release date                                                           | N        |
@@ -112,3 +128,8 @@ Each row contains information about a pre-processed chain or interface, and the 
 Notes: 
 - In the table, columns marked with 'Y' under 'Required' indicate that these columns are essential for training. If you are creating your own CSV for training purposes, these columns must be included. Columns marked with 'N' are optional and can be excluded. 
 - For rows where the "type" is "chain", the values in columns related to Chain 2 should all be filled with empty strings.
+- When `--rna-mode rna_monomer` is used, `pdb_id` stays as the original entry ID while
+  `bioassembly_name` points to the split single-chain file stem, typically
+  `<pdb_id>_<asym_id_int>`.
+- In this mode, only RNA / modified-RNA chains are emitted as split monomer samples;
+  DNA and DNA-RNA hybrid chains are not emitted.

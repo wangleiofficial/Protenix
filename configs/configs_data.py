@@ -21,6 +21,25 @@ from protenix.config.extend_types import GlobalConfigValue, ListValue
 
 PROTENIX_ROOT_DIR = os.environ.get("PROTENIX_ROOT_DIR", str(Path.home()))
 
+
+def _root_path(*parts: str) -> str:
+    """Builds a path under PROTENIX_ROOT_DIR."""
+    return os.path.join(PROTENIX_ROOT_DIR, *parts)
+
+
+def _prefer_existing_path(*relative_paths: str) -> str:
+    """
+    Returns the first existing path under PROTENIX_ROOT_DIR, or the first candidate.
+
+    This keeps configs convenient for the standard RNA directory layout while remaining
+    deterministic when files are not present yet.
+    """
+    candidates = [_root_path(path) for path in relative_paths]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0]
+
 default_test_configs = {
     "sampler_configs": {
         "sampler_type": "uniform",
@@ -41,8 +60,10 @@ default_test_configs = {
         "fix_seed": False,  # True means use use the same contact in each evaluation.
         "rna_ss": {
             "enable": False,
-            "raw_paths": ListValue([""]),
-            "seq_or_filename_to_ss_jsons": [],
+            "raw_paths": ListValue([_root_path("rna_ss_constraints")]),
+            "seq_or_filename_to_ss_jsons": ListValue(
+                [_root_path("rna_ss_constraints", "mapping_sequence_uid.json")]
+            ),
             "indexing_methods": ListValue(["sequence_uid"]),
             "strict": False,
         },
@@ -80,8 +101,10 @@ default_weighted_pdb_configs = {
         "fix_seed": False,
         "rna_ss": {
             "enable": False,
-            "raw_paths": ListValue([""]),
-            "seq_or_filename_to_ss_jsons": [],
+            "raw_paths": ListValue([_root_path("rna_ss_constraints")]),
+            "seq_or_filename_to_ss_jsons": ListValue(
+                [_root_path("rna_ss_constraints", "mapping_sequence_uid.json")]
+            ),
             "indexing_methods": ListValue(["sequence_uid"]),
             "strict": False,
         },
@@ -152,7 +175,7 @@ data_configs = {
     "test_sets": ListValue(["recentPDB_1536_sample384_0925"]),
     "weightedPDB_before2109_wopb_nometalc_0925": {
         "base_info": {
-            "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+            "mmcif_dir": _root_path("mmcif"),
             "bioassembly_dict_dir": os.path.join(
                 PROTENIX_ROOT_DIR, "mmcif_bioassembly"
             ),
@@ -173,7 +196,7 @@ data_configs = {
     },
     "recentPDB_1536_sample384_0925": {
         "base_info": {
-            "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+            "mmcif_dir": _root_path("mmcif"),
             "bioassembly_dict_dir": os.path.join(
                 PROTENIX_ROOT_DIR, "recentPDB_bioassembly"
             ),
@@ -207,6 +230,32 @@ data_configs = {
         },
         **deepcopy(default_test_configs),
     },
+    "rna_monomer_train": {
+        "base_info": {
+            "mmcif_dir": _root_path("mmcif"),
+            "bioassembly_dict_dir": _root_path("rna_monomer_bioassembly"),
+            "indices_fpath": _root_path("indices", "rna_monomer_train.csv"),
+            "pdb_list": "",
+            "random_sample_if_failed": True,
+            "max_n_token": -1,
+            "use_reference_chains_only": False,
+            "exclusion": {},
+        },
+        **deepcopy(default_weighted_pdb_configs),
+    },
+    "rna_monomer_val": {
+        "base_info": {
+            "mmcif_dir": _root_path("mmcif"),
+            "bioassembly_dict_dir": _root_path("rna_monomer_bioassembly"),
+            "indices_fpath": _root_path("indices", "rna_monomer_val.csv"),
+            "pdb_list": "",
+            "max_n_token": GlobalConfigValue("test_max_n_token"),
+            "sort_by_n_token": False,
+            "group_by_pdb_id": True,
+            "find_eval_chain_interface": False,
+        },
+        **deepcopy(default_test_configs),
+    },
     "msa": {
         "enable_prot_msa": True,
         "prot_seq_or_filename_to_msadir_jsons": ListValue(
@@ -223,11 +272,14 @@ data_configs = {
         "prot_indexing_methods": ListValue(["sequence"]),
         "enable_rna_msa": True,  # enable rna msa
         "rna_seq_or_filename_to_msadir_jsons": ListValue(
-            [os.path.join(PROTENIX_ROOT_DIR, "rna_msa/rna_sequence_to_pdb_chains.json")]
+            [
+                _prefer_existing_path(
+                    "rna_msa/mapping_sequence.json",
+                    "rna_msa/rna_sequence_to_pdb_chains.json",
+                )
+            ]
         ),
-        "rna_msadir_raw_paths": ListValue(
-            [os.path.join(PROTENIX_ROOT_DIR, "rna_msa/msas")]
-        ),
+        "rna_msadir_raw_paths": ListValue([_root_path("rna_msa", "msas")]),
         "rna_indexing_methods": ListValue(["sequence"]),
         "min_size": {
             "train": 1,
@@ -246,7 +298,7 @@ data_configs = {
         "enable_prot_template": True,
         "enable_rna_template": False,
         "template_dropout_rate": 0.0,
-        "prot_template_mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+        "prot_template_mmcif_dir": _root_path("mmcif"),
         "prot_template_cache_dir": "",
         "prot_template_raw_paths": ListValue(
             [os.path.join(PROTENIX_ROOT_DIR, "mmcif_msa_template")]
@@ -255,10 +307,12 @@ data_configs = {
             [os.path.join(PROTENIX_ROOT_DIR, "common/seq_to_pdb_index.json")]
         ),
         "prot_indexing_methods": ListValue(["sequence"]),
-        "rna_template_mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+        "rna_template_mmcif_dir": _root_path("mmcif"),
         "rna_template_cache_dir": "",
-        "rna_template_raw_paths": ListValue([""]),
-        "rna_seq_or_filename_to_templatedir_jsons": ListValue([""]),
+        "rna_template_raw_paths": ListValue([_root_path("rna_template_hits")]),
+        "rna_seq_or_filename_to_templatedir_jsons": ListValue(
+            [_root_path("rna_template_hits", "mapping_sequence_uid.json")]
+        ),
         "rna_indexing_methods": ListValue(["sequence_uid"]),
         "release_dates_path": os.path.join(
             PROTENIX_ROOT_DIR, "common/release_date_cache.json"

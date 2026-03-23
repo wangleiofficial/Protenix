@@ -3,6 +3,7 @@ import sys
 import types
 
 import numpy as np
+import pytest
 
 try:
     from rdkit.Chem import GetPeriodicTable  # noqa: F401
@@ -22,7 +23,7 @@ except ImportError:
 
 from protenix.data.constants import DENSE_ATOM, PROTEIN_CHAIN, RNA_CHAIN
 from protenix.data.template.template_parser import TemplateHit
-from protenix.data.template.template_featurizer import TemplateFeaturizer
+from protenix.data.template.template_featurizer import TemplateFeaturizer, Templates
 from protenix.data.template.template_utils import (
     DistogramFeaturesConfig,
     TemplateFeatures,
@@ -183,6 +184,80 @@ def _build_minimal_rna_mmcif(sequence: str) -> str:
     return "\n".join(lines)
 
 
+def _get_fixed_protein_template_features(tmp_path, sequence: str):
+    mmcif_dir = tmp_path / "protein_mmcif"
+    mmcif_dir.mkdir()
+    (mmcif_dir / "1abc.cif").write_text(_build_minimal_protein_mmcif(sequence))
+
+    release_dates_path = tmp_path / "protein_release_dates.json"
+    release_dates_path.write_text(json.dumps({"1abc": {"release_date": "2020-01-01"}}))
+
+    hit = TemplateHit(
+        index=1,
+        name="1abc_A",
+        aligned_cols=len(sequence),
+        sum_probs=99.0,
+        query=sequence,
+        hit_sequence=("A" * (len(sequence) - 1)) + "B",
+        indices_query=list(range(len(sequence))),
+        indices_hit=list(range(len(sequence))),
+    )
+
+    featurizer = TemplateHitFeaturizer(
+        mmcif_dir=str(mmcif_dir),
+        kalign_binary_path="kalign",
+        max_hits=1,
+        max_template_date="2021-01-01",
+        release_dates_path=str(release_dates_path),
+    )
+
+    result, _ = featurizer.get_templates(
+        sequence_uid="protein_regression",
+        query_sequence=sequence,
+        hits=[hit],
+        query_chain_type=PROTEIN_CHAIN,
+    )
+    packed = TemplateFeatures.package_template_features(hit_features=result.features)
+    return TemplateFeatures.fix_template_features(packed, num_res=len(sequence))
+
+
+def _get_fixed_rna_template_features(tmp_path, sequence: str):
+    mmcif_dir = tmp_path / "rna_mmcif"
+    mmcif_dir.mkdir()
+    (mmcif_dir / "1abc.cif").write_text(_build_minimal_rna_mmcif(sequence))
+
+    release_dates_path = tmp_path / "rna_release_dates.json"
+    release_dates_path.write_text(json.dumps({"1abc": {"release_date": "2020-01-01"}}))
+
+    hit = TemplateHit(
+        index=1,
+        name="1abc_C",
+        aligned_cols=len(sequence),
+        sum_probs=99.0,
+        query=sequence,
+        hit_sequence=sequence,
+        indices_query=list(range(len(sequence))),
+        indices_hit=list(range(len(sequence))),
+    )
+
+    featurizer = TemplateHitFeaturizer(
+        mmcif_dir=str(mmcif_dir),
+        kalign_binary_path="kalign",
+        max_hits=1,
+        max_template_date="2021-01-01",
+        release_dates_path=str(release_dates_path),
+    )
+
+    result, _ = featurizer.get_templates(
+        sequence_uid="rna_regression",
+        query_sequence=sequence,
+        hits=[hit],
+        query_chain_type=RNA_CHAIN,
+    )
+    packed = TemplateFeatures.package_template_features(hit_features=result.features)
+    return TemplateFeatures.fix_template_features(packed, num_res=len(sequence))
+
+
 def test_protein_template_regression_keeps_legacy_feature_path(tmp_path):
     sequence = "AAAAAAAAAA"
     mmcif_dir = tmp_path / "mmcif"
@@ -336,3 +411,79 @@ def test_training_rna_template_supports_sequence_uid_and_direct_csv_mapping(tmp_
     assert unit_vector.shape == (len(sequence), len(sequence), 3)
     assert float(np.abs(unit_vector).sum()) > 0.0
     assert float(backbone_frame_mask.sum()) > 0.0
+
+
+@pytest.mark.parametrize(
+    ("template_builder", "sequence"),
+    [
+        (_get_fixed_protein_template_features, "AAAAAAAAAA"),
+        (_get_fixed_rna_template_features, "AAAAAAAAAA"),
+    ],
+)
+def test_multichain_template_pair_features_are_masked_to_same_chain(
+    tmp_path, template_builder, sequence
+):
+    fixed = template_builder(tmp_path, sequence)
+    chain_len = len(sequence)
+
+    aatype = fixed["template_aatype"][0]
+    atom_positions = fixed["template_atom_positions"][0]
+    atom_mask = fixed["template_atom_mask"][0]
+
+    multichain_templates = Templates(
+        aatype=np.stack([np.concatenate([aatype, aatype], axis=0)]),
+        atom_positions=np.stack(
+            [
+                np.concatenate(
+                    [atom_positions, atom_positions + np.array([25.0, 0.0, 0.0])],
+                    axis=0,
+                )
+            ]
+        ),
+        atom_mask=np.stack([np.concatenate([atom_mask, atom_mask], axis=0)]),
+        residue_chain_indices=np.concatenate(
+            [
+                np.zeros(chain_len, dtype=np.int32),
+                np.ones(chain_len, dtype=np.int32),
+            ]
+        ),
+    ).as_protenix_dict()
+
+    cross_chain_slice = (slice(None, chain_len), slice(chain_len, None))
+    intra_chain_slice = (slice(None, chain_len), slice(None, chain_len))
+
+    cross_chain_dgram = multichain_templates["template_distogram"][
+        0, cross_chain_slice[0], cross_chain_slice[1]
+    ]
+    cross_chain_pb_mask = multichain_templates["template_pseudo_beta_mask"][
+        0, cross_chain_slice[0], cross_chain_slice[1]
+    ]
+    cross_chain_unit_vector = multichain_templates["template_unit_vector"][
+        0, cross_chain_slice[0], cross_chain_slice[1]
+    ]
+    cross_chain_backbone_mask = multichain_templates["template_backbone_frame_mask"][
+        0, cross_chain_slice[0], cross_chain_slice[1]
+    ]
+
+    assert float(cross_chain_dgram.sum()) == 0.0
+    assert float(cross_chain_pb_mask.sum()) == 0.0
+    assert float(np.abs(cross_chain_unit_vector).sum()) == 0.0
+    assert float(cross_chain_backbone_mask.sum()) == 0.0
+
+    intra_chain_dgram = multichain_templates["template_distogram"][
+        0, intra_chain_slice[0], intra_chain_slice[1]
+    ]
+    intra_chain_pb_mask = multichain_templates["template_pseudo_beta_mask"][
+        0, intra_chain_slice[0], intra_chain_slice[1]
+    ]
+    intra_chain_unit_vector = multichain_templates["template_unit_vector"][
+        0, intra_chain_slice[0], intra_chain_slice[1]
+    ]
+    intra_chain_backbone_mask = multichain_templates["template_backbone_frame_mask"][
+        0, intra_chain_slice[0], intra_chain_slice[1]
+    ]
+
+    assert float(intra_chain_dgram.sum()) > 0.0
+    assert float(intra_chain_pb_mask.sum()) > 0.0
+    assert float(np.abs(intra_chain_unit_vector).sum()) > 0.0
+    assert float(intra_chain_backbone_mask.sum()) > 0.0

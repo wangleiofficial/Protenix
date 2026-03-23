@@ -1515,7 +1515,11 @@ class MMCIFParser:
                     else:
                         cluster_id = "NotInClusterTxt"
 
-            elif "ribonucleotide" in entity_type:
+            elif entity_type in {
+                "polyribonucleotide",
+                "polydeoxyribonucleotide",
+                "polydeoxyribonucleotide/polyribonucleotide hybrid",
+            }:
                 mol_type = "nuc"
                 cluster_id = ccd.res_names_to_sequence(res_names)
             else:

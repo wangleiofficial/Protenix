@@ -15,13 +15,16 @@ This guide assumes:
 
 - you are training **single-chain RNA** structures
 - your training samples are stored as Protenix `Bioassembly Dict` `.pkl.gz` files
-- if your RNA chains were extracted from complexes, you already split them into **single-chain samples**
+- you use `prepare_training_data.py --rna-mode rna_monomer` or an equivalent pipeline
+  to build **single-chain RNA samples**
 
 Important notes:
 
 - If you use `sequence_uid`-based mapping, the current convention is:
   - `sequence_uid = <pdb_id>_<asym_id_int>`
-- If you split chains out of complexes, keep the intended `asym_id_int` stable when building mapping files.
+- If you split chains out of complexes, keep the intended `asym_id_int` stable when
+  building mapping files. The current `rna_monomer` mode already does this by naming
+  each saved sample as `<pdb_id>_<asym_id_int>.pkl.gz`.
 - External predicted RNA secondary-structure constraints are currently interpreted in the **token order of the training sample**. In practice, this is easiest when a training sample contains the **full RNA chain** and fits inside the crop.
 
 ## Required Data
@@ -37,6 +40,59 @@ Optional but supported:
 2. RNA templates
 3. predicted RNA secondary-structure constraints
 
+## Optional: Build a Raw RNA PDB Corpus
+
+If you do **not** already have a local RNA structure collection, you can first build one
+from the PDB directly.
+
+The helper script below will:
+
+1. search RCSB for entries with RNA polymers
+2. download the corresponding `mmCIF` files into one directory
+
+Example:
+
+```bash
+export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+export PROTENIX_ROOT_DIR=/path/to/your/data_root
+
+python scripts/database/download_rna_pdb_dataset.py \
+  --mmcif-dir $PROTENIX_ROOT_DIR/mmcif \
+  --entry-id-list-out $PROTENIX_ROOT_DIR/indices/rna_pdb_ids.txt
+```
+
+Then preprocess the downloaded `mmCIF` files with an explicit RNA mode:
+
+```bash
+python scripts/prepare_training_data.py \
+  -i $PROTENIX_ROOT_DIR/mmcif \
+  -o $PROTENIX_ROOT_DIR/indices/rna_monomer_train.csv \
+  -b $PROTENIX_ROOT_DIR/rna_monomer_bioassembly \
+  -c /path/to/clusters-by-entity-40.txt \
+  -n 8 \
+  --rna-mode rna_monomer
+```
+
+Notes:
+
+- By default the search uses `rcsb_entry_info.polymer_entity_count_RNA > 0`
+  with `resolution <= 4.5`, which is closer to the current Protenix training filters.
+- This gives you a **raw RNA-related corpus**.
+- RNA-specific preprocessing is now **separated** from download. Use
+  `prepare_training_data.py --rna-mode ...` to choose the subset you want.
+- Supported `--rna-mode` values are:
+  - `rna_monomer`: extract every RNA chain and save it as its own single-chain
+    sample, including RNA chains originating from RNA complexes, RNA-protein
+    complexes, or DNA-RNA complexes
+  - `rna_only`: RNA-only assemblies, including RNA monomers and RNA-RNA complexes
+  - `rna_all`: RNA monomers, RNA-RNA complexes, and RNA-protein complexes
+- DNA and DNA-RNA hybrid chains are **not** emitted as `rna_monomer` samples.
+- `rna_only` and `rna_all` still exclude assemblies containing DNA / DNA-RNA hybrid
+  polymer chains.
+- Useful helper:
+  [download_rna_pdb_dataset.py](../scripts/database/download_rna_pdb_dataset.py)
+  and [prepare_training_data.py](../scripts/prepare_training_data.py)
+
 ## Recommended Folder Layout
 
 ```text
@@ -44,10 +100,13 @@ $PROTENIX_ROOT_DIR/
   mmcif/
     1abc.cif
     2xyz.cif
+    4v4q.cif
+    9gmw.cif
 
   rna_monomer_bioassembly/
-    1abc.pkl.gz
-    2xyz.pkl.gz
+    1abc_2.pkl.gz
+    1abc_5.pkl.gz
+    2xyz_0.pkl.gz
 
   indices/
     rna_monomer_train.csv
@@ -66,11 +125,6 @@ $PROTENIX_ROOT_DIR/
     1abc_2.csv
     2xyz_0.m8
 
-  rna_template_mmcif/
-    1abc.cif
-    4v4q.cif
-    9gmw.cif
-
   rna_ss_constraints/
     mapping_sequence_uid.json
     1abc_2.json
@@ -79,7 +133,11 @@ $PROTENIX_ROOT_DIR/
 
 Notes:
 
-- `rna_template_mmcif/` can be the same directory as your main mmCIF library if it already contains all template structures.
+- One shared `mmcif/` directory is usually enough. It can serve both:
+  - `data.<dataset>.base_info.mmcif_dir`
+  - `data.template.rna_template_mmcif_dir`
+- The only requirement is that this directory must contain every `<pdb_id>.cif` needed by your RNA template hit tables, not just the training samples themselves.
+- If you prefer, you can still keep a separate template-specific mmCIF directory, but it is optional.
 - `rna_template_hits/` and `rna_ss_constraints/` are both keyed by `sequence_uid`.
 - `rna_msa/` is keyed by **sequence**, not `sequence_uid`.
 
@@ -96,7 +154,10 @@ For monomer RNA training, the practical recommendation is:
 - `num_prot_chains = 0`
 - `num_assembly_polymer_chains = 1`
 
-If the chain came from a complex, keep the intended `asym_id_int` consistent with the `sequence_uid` mapping you plan to use for templates and predicted secondary structure.
+When using `prepare_training_data.py --rna-mode rna_monomer`, the saved sample name is
+`<pdb_id>_<asym_id_int>.pkl.gz`, and the stored `atom_array` keeps that original
+`asym_id_int`. This is the recommended basis for `sequence_uid`-keyed RNA template and
+predicted secondary-structure mappings.
 
 ## 2. Indices CSV
 
@@ -106,12 +167,51 @@ For monomer RNA chain rows, the important fields are:
 
 - `type = chain`
 - `pdb_id`
+- `bioassembly_name`
 - `entity_1_id`
 - `chain_1_id`
 - `mol_1_type = nuc`
 - `cluster_1_id`
 
 For `type = chain` rows, the chain-2-related columns can remain empty.
+
+When `rna_monomer` is produced automatically from mixed assemblies:
+
+- `pdb_id` remains the original PDB code
+- `bioassembly_name = <pdb_id>_<asym_id_int>` is used to locate the saved `.pkl.gz`
+- `sequence_uid` for templates and RNA secondary structure still follows
+  `<pdb_id>_<asym_id_int>`
+
+## 2.1 Time-Based Test Split
+
+For monomer RNA evaluation, a common setup is:
+
+- use structures released **before** a cutoff date for training
+- use structures released **on or after** that cutoff date for testing
+- remove test samples whose canonical RNA sequence is **100% identical** to any
+  training sample
+
+The helper script below does exactly this for RNA chain rows:
+
+```bash
+python scripts/build_rna_time_split.py \
+  --indices $PROTENIX_ROOT_DIR/indices/rna_monomer_all.csv \
+  --bioassembly-dir $PROTENIX_ROOT_DIR/rna_monomer_bioassembly \
+  --test-release-date-from 2021-09-30 \
+  --train-out $PROTENIX_ROOT_DIR/indices/rna_monomer_train.csv \
+  --test-out $PROTENIX_ROOT_DIR/indices/rna_monomer_val.csv \
+  --dropped-test-out $PROTENIX_ROOT_DIR/indices/rna_monomer_test_dropped_exact_train_match.csv \
+  --test-pdb-list-out $PROTENIX_ROOT_DIR/indices/rna_monomer_test_pdb_id.txt
+```
+
+Notes:
+
+- The script only considers `type = chain` rows with `sub_mol_1_type` in
+  `{rna, modified_rna}`.
+- Exact-match filtering is done on the canonical single-chain sequence loaded from the
+  saved `Bioassembly Dict` files.
+- The output test set is therefore a **time-split RNA monomer set with 100% sequence
+  matches to train removed**.
 
 ## 3. RNA MSA Format
 
@@ -298,7 +398,35 @@ If you enable `reassign_continuous_chain_ids`, rebuild your `sequence_uid` mappi
 
 ## 7. Config Example
 
-Below is a minimal example of how to wire a custom monomer RNA dataset into `configs/configs_data.py`.
+The repository now ships with built-in dataset entries:
+
+- `rna_monomer_train`
+- `rna_monomer_val`
+
+They are defined in [configs_data.py](../configs/configs_data.py) and expect the following default layout under `PROTENIX_ROOT_DIR`:
+
+- `mmcif/`
+- `rna_monomer_bioassembly/`
+- `indices/rna_monomer_train.csv`
+- `indices/rna_monomer_val.csv`
+
+If your files follow that layout, you can use these dataset names directly without editing `configs/configs_data.py`.
+
+For RNA feature loading, the built-in config now also auto-points to the standard paths:
+
+- RNA MSA mapping: `rna_msa/mapping_sequence.json`
+  fallback: `rna_msa/rna_sequence_to_pdb_chains.json`
+- RNA MSA directory: `rna_msa/msas/`
+- RNA template mapping: `rna_template_hits/mapping_sequence_uid.json`
+- RNA template root: `rna_template_hits/`
+- predicted RNA SS mapping: `rna_ss_constraints/mapping_sequence_uid.json`
+- predicted RNA SS root: `rna_ss_constraints/`
+
+So in the standard layout, you usually only need to:
+
+1. set `PROTENIX_ROOT_DIR`
+2. place files in the default directories
+3. enable the corresponding feature flags
 
 ### Dataset entry
 
@@ -315,6 +443,20 @@ data_configs["rna_monomer_train"] = {
         "exclusion": {},
     },
     **deepcopy(default_weighted_pdb_configs),
+}
+
+data_configs["rna_monomer_val"] = {
+    "base_info": {
+        "mmcif_dir": os.path.join(PROTENIX_ROOT_DIR, "mmcif"),
+        "bioassembly_dict_dir": os.path.join(PROTENIX_ROOT_DIR, "rna_monomer_bioassembly"),
+        "indices_fpath": os.path.join(PROTENIX_ROOT_DIR, "indices/rna_monomer_val.csv"),
+        "pdb_list": "",
+        "max_n_token": GlobalConfigValue("test_max_n_token"),
+        "sort_by_n_token": False,
+        "group_by_pdb_id": True,
+        "find_eval_chain_interface": False,
+    },
+    **deepcopy(default_test_configs),
 }
 ```
 
@@ -336,9 +478,11 @@ data_configs["msa"]["rna_indexing_methods"] = ["sequence"]
 ```python
 data_configs["template"]["enable_rna_template"] = True
 data_configs["template"]["rna_template_mmcif_dir"] = os.path.join(
-    PROTENIX_ROOT_DIR, "rna_template_mmcif"
+    PROTENIX_ROOT_DIR, "mmcif"
 )
-data_configs["template"]["rna_template_raw_paths"] = [""]
+data_configs["template"]["rna_template_raw_paths"] = [
+    os.path.join(PROTENIX_ROOT_DIR, "rna_template_hits")
+]
 data_configs["template"]["rna_seq_or_filename_to_templatedir_jsons"] = [
     os.path.join(PROTENIX_ROOT_DIR, "rna_template_hits/mapping_sequence_uid.json")
 ]
@@ -351,7 +495,9 @@ data_configs["template"]["rna_indexing_methods"] = ["sequence_uid"]
 data_configs["rna_monomer_train"]["constraint"]["enable"] = True
 data_configs["rna_monomer_train"]["constraint"]["contact"]["prob"] = 0.0
 data_configs["rna_monomer_train"]["constraint"]["rna_ss"]["enable"] = True
-data_configs["rna_monomer_train"]["constraint"]["rna_ss"]["raw_paths"] = [""]
+data_configs["rna_monomer_train"]["constraint"]["rna_ss"]["raw_paths"] = [
+    os.path.join(PROTENIX_ROOT_DIR, "rna_ss_constraints")
+]
 data_configs["rna_monomer_train"]["constraint"]["rna_ss"][
     "seq_or_filename_to_ss_jsons"
 ] = [
@@ -370,13 +516,38 @@ Enable the contact constraint branch in the model config:
 configs.model.constraint_embedder.contact_embedder.enable = True
 ```
 
-## 8. Training Command
+## 8. Fine-tuning Command
 
-After editing your dataset/config entries, a typical launch command looks like:
+In practice, the recommended RNA training workflow is to **fine-tune from a released
+Protenix checkpoint**, not to start from random initialization.
+
+If you use:
+
+- RNA MSA only
+- RNA template only
+
+then the released `protenix_base_default_v1.0.0` checkpoint already matches the base
+architecture.
+
+If you additionally enable predicted RNA secondary structure through
+`model.constraint_embedder.contact_embedder.enable = True`, you are adding a branch
+that is **disabled in the released base checkpoint config**. In that case, load with
+`load_strict = false` so the new constraint-embedder parameters can be initialized
+instead of causing a strict load failure.
+
+Also note:
+
+- if EMA is enabled (`ema_decay > 0`), set both `load_checkpoint_path` and
+  `load_ema_checkpoint_path`
+- using only `load_checkpoint_path` is not enough for a clean fine-tuning start when EMA
+  is active
+
+After editing your dataset/config entries, a typical fine-tuning launch command looks like:
 
 ```bash
 export PYTHONPATH="${PYTHONPATH}:$(pwd)"
 export PROTENIX_ROOT_DIR=/path/to/your/data_root
+checkpoint_path="${PROTENIX_ROOT_DIR}/checkpoint/protenix_base_default_v1.0.0.pt"
 
 python3 runner/train.py \
   --run_name rna_monomer_train \
@@ -393,6 +564,9 @@ python3 runner/train.py \
   --sample_diffusion.N_step 20 \
   --triangle_attention cuequivariance \
   --triangle_multiplicative cuequivariance \
+  --load_checkpoint_path ${checkpoint_path} \
+  --load_ema_checkpoint_path ${checkpoint_path} \
+  --load_strict false \
   --data.train_sets rna_monomer_train \
   --data.test_sets rna_monomer_val \
   --data.msa.enable_rna_msa true \
@@ -403,7 +577,13 @@ python3 runner/train.py \
   --model.constraint_embedder.contact_embedder.enable true
 ```
 
-If you prefer the demo script, you can also start from [train_demo.sh](../train_demo.sh) and replace the dataset/config arguments there.
+If you are **not** using predicted RNA secondary structure and therefore keep
+`model.constraint_embedder.contact_embedder.enable = false`, you can usually keep
+`load_strict = true`.
+
+If you prefer the demo script, start from [finetune_demo.sh](../finetune_demo.sh)
+rather than [train_demo.sh](../train_demo.sh), because the RNA workflow here is a
+fine-tuning workflow.
 
 ## 9. Checklist
 
@@ -424,5 +604,7 @@ Before starting training, verify the following:
 - [prepare_training_data.md](./prepare_training_data.md)
 - [training_inference_instructions.md](./training_inference_instructions.md)
 - [infer_json_format.md](./infer_json_format.md)
+- [download_rna_pdb_dataset.py](../scripts/database/download_rna_pdb_dataset.py)
+- [build_rna_time_split.py](../scripts/build_rna_time_split.py)
 - [split_rna_template_hits.py](../scripts/split_rna_template_hits.py)
 - [rna_ss_to_constraint_json.py](../scripts/rna_ss_to_constraint_json.py)

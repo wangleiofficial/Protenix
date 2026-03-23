@@ -213,6 +213,7 @@ class TemplateFeatureAssemblyLine:
             An assembled Templates object.
         """
         np_chains_list = []
+        residue_chain_indices = []
         polymer_entity_features = {True: {}, False: {}}
         # Identify entities where template features can be safely copied (same sequence)
         safe_entity_ids = get_safe_entity_id_for_template_copy(bioassembly)
@@ -259,6 +260,9 @@ class TemplateFeatureAssemblyLine:
 
             feats["chain_id"] = chain_id
             np_chains_list.append(feats)
+            residue_chain_indices.append(
+                np.full(num_tokens, asym_id, dtype=np.int32)
+            )
 
         # Pad the number of templates to max_templates for each chain to allow concatenation
         for chain in np_chains_list:
@@ -285,11 +289,15 @@ class TemplateFeatureAssemblyLine:
             merged_example[feature_name] = v[
                 : self.max_templates, standard_token_idxs, ...
             ]
+        merged_chain_indices = np.concatenate(residue_chain_indices, axis=0)[
+            standard_token_idxs
+        ]
 
         return Templates(
             aatype=merged_example["template_aatype"],
             atom_positions=merged_example["template_atom_positions"],
             atom_mask=merged_example["template_atom_mask"].astype(bool),
+            residue_chain_indices=merged_chain_indices.astype(np.int32),
         )
 
 
@@ -759,6 +767,8 @@ class Templates:
     atom_positions: np.ndarray
     # atom_mask: [num_templates, num_res, 24]
     atom_mask: np.ndarray
+    # residue_chain_indices: [num_res]
+    residue_chain_indices: Optional[np.ndarray] = None
 
     @classmethod
     def from_data_dict(cls, batch: BatchDict) -> Self:
@@ -782,6 +792,12 @@ class Templates:
         features = self.as_data_dict()
         dgrams, pb_masks = [], []
         unit_vectors, bb_masks = [], []
+        same_chain_mask = None
+        if self.residue_chain_indices is not None:
+            same_chain_mask = (
+                self.residue_chain_indices[:, None]
+                == self.residue_chain_indices[None, :]
+            ).astype(np.float32)
 
         num_templates = self.aatype.shape[0]
         for i in range(num_templates):
@@ -792,6 +808,8 @@ class Templates:
             # Compute pseudo-beta positions and mask
             pb_pos, pb_mask = TemplateFeatures.pseudo_beta_fn(aatype, pos, mask)
             pb_mask_2d = pb_mask[:, None] * pb_mask[None, :]
+            if same_chain_mask is not None:
+                pb_mask_2d = pb_mask_2d * same_chain_mask
 
             # Compute distogram
             dgram = TemplateFeatures.dgram_from_positions(
@@ -807,6 +825,8 @@ class Templates:
             uv, bb_mask_2d = TemplateFeatures.compute_template_unit_vector(
                 aatype, pos, mask
             )
+            if same_chain_mask is not None:
+                bb_mask_2d = bb_mask_2d * same_chain_mask
             unit_vectors.append(uv * bb_mask_2d[..., None])
             bb_masks.append(bb_mask_2d)
 

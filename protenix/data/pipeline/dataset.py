@@ -410,8 +410,9 @@ class BaseSingleDataset(Dataset):
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         sample_indice = self._get_sample_indice(idx=idx)
         if self.bioassembly_dict_dir is not None:
+            bioassembly_name = self.get_bioassembly_pickle_stem(sample_indice)
             bioassembly_dict_fpath = os.path.join(
-                self.bioassembly_dict_dir, sample_indice.pdb_id + ".pkl.gz"
+                self.bioassembly_dict_dir, bioassembly_name + ".pkl.gz"
             )
         else:
             bioassembly_dict_fpath = None
@@ -421,6 +422,11 @@ class BaseSingleDataset(Dataset):
         )
         bioassembly_dict["pdb_id"] = sample_indice.pdb_id
         return sample_indice, bioassembly_dict, bioassembly_dict_fpath
+
+    @staticmethod
+    def get_bioassembly_pickle_stem(sample_indice: pd.Series) -> str:
+        """Returns the file stem for locating a saved bioassembly pickle."""
+        return getattr(sample_indice, "bioassembly_name", "") or sample_indice.pdb_id
 
     @staticmethod
     def _reassign_atom_array_chain_id(atom_array: AtomArray):
