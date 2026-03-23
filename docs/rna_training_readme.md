@@ -541,8 +541,24 @@ Also note:
   `load_ema_checkpoint_path`
 - using only `load_checkpoint_path` is not enough for a clean fine-tuning start when EMA
   is active
+- the generic `finetune_demo.sh` values (`100000` steps, `2000` warmup, `0.001` lr)
+  are too aggressive for most RNA fine-tuning runs
 
-After editing your dataset/config entries, a typical fine-tuning launch command looks like:
+Recommended starting points:
+
+- full-model RNA fine-tuning:
+  - `lr = 3e-4`
+  - `warmup_steps = 1000`
+  - `max_steps = 20000`
+  - `lr_scheduler = cosine_annealing`
+- RNA secondary-structure branch prioritized fine-tuning:
+  - backbone `lr = 1e-4`
+  - `constraint_embedder.contact_z_embedder` `finetune.lr = 1e-3`
+  - `warmup_steps = 1000`
+  - `max_steps = 20000`
+  - `lr_scheduler = cosine_annealing`
+
+If you want a conservative full-model RNA fine-tuning command, use:
 
 ```bash
 export PYTHONPATH="${PYTHONPATH}:$(pwd)"
@@ -557,9 +573,52 @@ python3 runner/train.py \
   --use_wandb false \
   --train_crop_size 384 \
   --diffusion_batch_size 48 \
-  --max_steps 100000 \
-  --warmup_steps 2000 \
-  --lr 0.001 \
+  --max_steps 20000 \
+  --warmup_steps 1000 \
+  --lr_scheduler cosine_annealing \
+  --lr 3e-4 \
+  --model.N_cycle 4 \
+  --sample_diffusion.N_step 20 \
+  --triangle_attention cuequivariance \
+  --triangle_multiplicative cuequivariance \
+  --load_checkpoint_path ${checkpoint_path} \
+  --load_ema_checkpoint_path ${checkpoint_path} \
+  --load_strict false \
+  --data.train_sets rna_monomer_train \
+  --data.test_sets rna_monomer_val \
+  --data.msa.enable_rna_msa true \
+  --data.template.enable_rna_template true \
+  --data.rna_monomer_train.constraint.enable true \
+  --data.rna_monomer_train.constraint.rna_ss.enable true \
+  --data.rna_monomer_train.constraint.contact.prob 0.0 \
+  --model.constraint_embedder.contact_embedder.enable true
+```
+
+If you want to prioritize the newly added RNA secondary-structure contact branch while
+still updating the backbone more conservatively, use:
+
+```bash
+export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+export PROTENIX_ROOT_DIR=/path/to/your/data_root
+checkpoint_path="${PROTENIX_ROOT_DIR}/checkpoint/protenix_base_default_v1.0.0.pt"
+
+python3 runner/train.py \
+  --run_name rna_monomer_train_ss_head \
+  --model_name protenix_base_default_v1.0.0 \
+  --base_dir ./output \
+  --dtype bf16 \
+  --use_wandb false \
+  --train_crop_size 384 \
+  --diffusion_batch_size 48 \
+  --max_steps 20000 \
+  --warmup_steps 1000 \
+  --lr_scheduler cosine_annealing \
+  --lr 1e-4 \
+  --finetune.lr 1e-3 \
+  --finetune.lr_scheduler cosine_annealing \
+  --finetune.warmup_steps 1000 \
+  --finetune.max_steps 20000 \
+  --finetune_params_with_substring constraint_embedder.contact_z_embedder \
   --model.N_cycle 4 \
   --sample_diffusion.N_step 20 \
   --triangle_attention cuequivariance \
@@ -581,9 +640,12 @@ If you are **not** using predicted RNA secondary structure and therefore keep
 `model.constraint_embedder.contact_embedder.enable = false`, you can usually keep
 `load_strict = true`.
 
-If you prefer the demo script, start from [finetune_demo.sh](../finetune_demo.sh)
-rather than [train_demo.sh](../train_demo.sh), because the RNA workflow here is a
-fine-tuning workflow.
+If you prefer a runnable demo script, use [finetune_rna_demo.sh](../finetune_rna_demo.sh)
+for RNA fine-tuning and [finetune_demo.sh](../finetune_demo.sh) for the general
+non-RNA example. The RNA demo supports:
+
+- `RNA_FINETUNE_MODE=full`
+- `RNA_FINETUNE_MODE=ss_head`
 
 ## 9. Checklist
 

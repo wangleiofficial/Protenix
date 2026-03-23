@@ -17,6 +17,9 @@ export PYTHONPATH="${PYTHONPATH}:$(pwd)"
 # Kernel options:
 # - triangle_attention: supports 'triattention', 'cuequivariance', 'deepspeed', 'torch'
 # - triangle_multiplicative: supports 'cuequivariance', 'torch'
+#
+# This script is a general finetuning demo.
+# For the RNA-specific workflow in docs/rna_training_readme.md, use ./finetune_rna_demo.sh.
 
 # Specify your data root directory by uncommenting the following line.
 # export PROTENIX_ROOT_DIR="/modify/to/your/data_root_dir"
