@@ -25,7 +25,8 @@ checkpoint_path="${PROTENIX_ROOT_DIR}/checkpoint/protenix_base_default_v1.0.0.pt
 
 # RNA finetuning modes:
 # - full: conservative full-model finetuning
-# - ss_head: prioritize the newly added RNA secondary-structure contact branch
+# - ss_template_head: prioritize the RNA secondary-structure contact branch and template embedder
+#   (`ss_head` is kept as a backward-compatible alias)
 RNA_FINETUNE_MODE="${RNA_FINETUNE_MODE:-full}"
 
 common_args=(
@@ -68,19 +69,19 @@ case "${RNA_FINETUNE_MODE}" in
       --run_name rna_monomer_finetune_full \
       --lr 3e-4
     ;;
-  ss_head)
+  ss_template_head|ss_head)
     exec "${common_args[@]}" \
-      --run_name rna_monomer_finetune_ss_head \
+      --run_name rna_monomer_finetune_ss_template_head \
       --lr 1e-4 \
       --finetune.lr 1e-3 \
       --finetune.lr_scheduler cosine_annealing \
       --finetune.warmup_steps 1000 \
       --finetune.max_steps 20000 \
-      --finetune_params_with_substring constraint_embedder.contact_z_embedder
+      --finetune_params_with_substring constraint_embedder.contact_z_embedder,template_embedder
     ;;
   *)
     echo "Unknown RNA_FINETUNE_MODE: ${RNA_FINETUNE_MODE}" >&2
-    echo "Expected one of: full, ss_head" >&2
+    echo "Expected one of: full, ss_template_head" >&2
     exit 1
     ;;
 esac

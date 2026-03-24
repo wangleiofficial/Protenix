@@ -37,6 +37,11 @@
 #   --use_rna_msa (bool):    Enable RNA MSA features (v1.0.0+ only).
 #   --use_seeds_in_json:     Prioritize seeds defined in the input JSON.
 #
+# RNA users:
+#   For RNA-specific inference examples, including RNA template and predicted
+#   RNA secondary-structure constraints, use ./inference_rna_demo.sh and
+#   docs/rna_inference_readme.md.
+#
 # Available Models (Ref: configs/configs_model_type.py, docs/supported_models.md):
 #   * protenix_base_default_v1.0.0:    [DEFAULT] Advanced model supporting Template & RNA MSA (Training Data Cutoff: 2021-09-30).
 #   1. protenix_base_20250630_v1.0.0:  Latest model for practical scenarios (Training Data Cutoff: 2025-06-30).

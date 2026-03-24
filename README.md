@@ -79,6 +79,7 @@ protenix pred -i examples/input.json -o ./output -n protenix_base_default_v1.0.0
 For a complete list of supported models, please refer to [Supported Models](docs/supported_models.md).
 
 For detailed instructions on installation, data preprocessing, inference, and training, please refer to the [Training and Inference Instructions](docs/training_inference_instructions.md). We recommend users refer to [inference_demo.sh](inference_demo.sh) for detailed inference methods and input explanations.
+For RNA-specific inference with RNA MSA, RNA templates, and predicted RNA secondary-structure constraints, see [RNA Inference README](docs/rna_inference_readme.md).
 For monomer RNA training with RNA MSA, RNA templates, and predicted RNA secondary-structure constraints, see [RNA Training README](docs/rna_training_readme.md).
 
 

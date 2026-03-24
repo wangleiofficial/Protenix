@@ -551,9 +551,10 @@ Recommended starting points:
   - `warmup_steps = 1000`
   - `max_steps = 20000`
   - `lr_scheduler = cosine_annealing`
-- RNA secondary-structure branch prioritized fine-tuning:
+- RNA secondary-structure + template prioritized fine-tuning:
   - backbone `lr = 1e-4`
   - `constraint_embedder.contact_z_embedder` `finetune.lr = 1e-3`
+  - `template_embedder` `finetune.lr = 1e-3`
   - `warmup_steps = 1000`
   - `max_steps = 20000`
   - `lr_scheduler = cosine_annealing`
@@ -594,8 +595,8 @@ python3 runner/train.py \
   --model.constraint_embedder.contact_embedder.enable true
 ```
 
-If you want to prioritize the newly added RNA secondary-structure contact branch while
-still updating the backbone more conservatively, use:
+If you want to prioritize the RNA secondary-structure contact branch and RNA template
+adaptation while still updating the backbone more conservatively, use:
 
 ```bash
 export PYTHONPATH="${PYTHONPATH}:$(pwd)"
@@ -603,7 +604,7 @@ export PROTENIX_ROOT_DIR=/path/to/your/data_root
 checkpoint_path="${PROTENIX_ROOT_DIR}/checkpoint/protenix_base_default_v1.0.0.pt"
 
 python3 runner/train.py \
-  --run_name rna_monomer_train_ss_head \
+  --run_name rna_monomer_train_ss_template_head \
   --model_name protenix_base_default_v1.0.0 \
   --base_dir ./output \
   --dtype bf16 \
@@ -618,7 +619,7 @@ python3 runner/train.py \
   --finetune.lr_scheduler cosine_annealing \
   --finetune.warmup_steps 1000 \
   --finetune.max_steps 20000 \
-  --finetune_params_with_substring constraint_embedder.contact_z_embedder \
+  --finetune_params_with_substring constraint_embedder.contact_z_embedder,template_embedder \
   --model.N_cycle 4 \
   --sample_diffusion.N_step 20 \
   --triangle_attention cuequivariance \
@@ -645,7 +646,17 @@ for RNA fine-tuning and [finetune_demo.sh](../finetune_demo.sh) for the general
 non-RNA example. The RNA demo supports:
 
 - `RNA_FINETUNE_MODE=full`
-- `RNA_FINETUNE_MODE=ss_head`
+- `RNA_FINETUNE_MODE=ss_template_head`
+- `RNA_FINETUNE_MODE=ss_head` (backward-compatible alias)
+
+Practical note:
+
+- `contact_z_embedder` is a newly enabled branch, so giving it a higher learning rate is
+  important when you use predicted RNA secondary structure
+- `template_embedder` already exists in the released v1.0.0 checkpoint, but if your goal
+  is to improve **RNA template utilization**, it is usually better to include it in
+  `finetune_params_with_substring` as well, rather than leaving it only on the smaller
+  backbone learning rate
 
 ## 9. Checklist
 

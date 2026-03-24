@@ -127,6 +127,10 @@ Key arguments in `inference_demo.sh`:
 * `model.N_cycle`: Number of recycling steps.
 * `use_template`: Whether to use structural templates (requires `templatesPath` in the input JSON).
 
+If you are preparing an **RNA** inference setup with RNA MSA, RNA templates, or
+predicted RNA secondary-structure constraints, see [RNA Inference README](./rna_inference_readme.md)
+and [inference_rna_demo.sh](../inference_rna_demo.sh).
+
 > **Performance Tip**: By default, specialized CUDA kernels are enabled. For significant speedups on NVIDIA GPUs, follow the [**Kernels Setup Guide**](./kernels.md).
 
 
